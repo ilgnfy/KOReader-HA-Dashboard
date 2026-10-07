@@ -420,8 +420,13 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
 
     local function currentHeater() return heaters[selected] end
 
+    -- Includes `selected`: switching the displayed heater must always
+    -- repaint, even when neither heater's own HA state happens to have
+    -- changed (e.g. both are already off) -- otherwise the diff check
+    -- below sees an identical signature and silently skips the redraw,
+    -- which looked like the selector just not responding to taps.
     local function computeSignature()
-        local parts = {}
+        local parts = { tostring(selected) }
         for _, h in ipairs(heaters) do
             local s = heater_states[h.entity]
             table.insert(parts, s and string.format(
@@ -824,7 +829,7 @@ local function buildHeaderSensorBox(settings, states)
     }
 end
 
-local function buildHeader(width, greeting, sensor_box)
+local function buildHeader(width, greeting, sensor_box, exit_callback)
     local height = Screen:scaleBySize(70)
     local left_items = {
         TextWidget:new{
@@ -854,12 +859,28 @@ local function buildHeader(width, greeting, sensor_box)
         face = Font:getFace("cfont", 20),
         fgcolor = Blitbuffer.COLOR_GRAY_5,
     }
+    -- Full-screen modal with no built-in way back to KOReader's own menu
+    -- (Settings, file browser, etc) -- this is the only way out of it.
+    -- Lives in the header's own row (not a floating corner overlay) so it
+    -- can't overlap the time/battery text.
+    local exit_btn = Button:new{
+        text = "\u{2699}",
+        width = Screen:scaleBySize(36),
+        height = Screen:scaleBySize(36),
+        background = Blitbuffer.COLOR_WHITE,
+        bordersize = Size.border.window,
+        radius = Screen:scaleBySize(18),
+        text_font_size = 18,
+        callback = exit_callback,
+    }
     local stale_frame = FrameContainer:new{
         bordersize = 0,
         padding = 0,
         HorizontalGroup:new{
             stale_text,
             HorizontalSpan:new{ width = Size.span.horizontal_small },
+            exit_btn,
+            HorizontalSpan:new{ width = Size.span.horizontal_default },
             time_text,
         },
     }
@@ -967,7 +988,9 @@ function HaDashboard:init()
     local states = fetchAllStates(settings)
     local forecast = fetchForecast(settings)
     local content_w = self.dimen.w - GUTTER * 2
-    local header, stale_frame = buildHeader(content_w, greetingForHour(), buildHeaderSensorBox(settings, states))
+    local header, stale_frame = buildHeader(content_w, greetingForHour(), buildHeaderSensorBox(settings, states), function()
+        UIManager:close(self)
+    end)
     self.stale_frame = stale_frame
     local rows = {
         header,
@@ -1147,13 +1170,22 @@ local HaDash = WidgetContainer:extend{
     name = "hadash",
 }
 
+-- Module-level (not per-instance): KOReader reinstantiates every plugin on
+-- each FileManager/Reader switch, not just at process startup -- so
+-- without this, auto_open fires every single time the dashboard closes
+-- and FileManager flashes underneath it, making it impossible to ever
+-- actually leave. A plain local here persists for the life of the Lua
+-- process (the module is only require()'d once), so it only fires once
+-- per real boot/launch.
+local has_auto_opened = false
+
 function HaDash:init()
     self.ui.menu:registerToMainMenu(self)
     local settings = loadSettings()
-    -- Emulator/dev convenience: jump straight to the dashboard on boot
-    -- instead of needing Tools > HA Dashboard every run. Set auto_open =
-    -- true in hadash_settings.lua. Not meant for the real Kindle deploy.
-    if settings and settings.auto_open then
+    -- Jump straight to the dashboard on first launch instead of needing
+    -- Tools > HA Dashboard. Set auto_open = true in hadash_settings.lua.
+    if settings and settings.auto_open and not has_auto_opened then
+        has_auto_opened = true
         UIManager:scheduleIn(1, function()
             UIManager:show(HaDashboard:new{})
         end)

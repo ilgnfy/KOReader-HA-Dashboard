@@ -3,3 +3,4 @@ hadash_settings.lua
 *.swp
 .DS_Store
 .claude/
+.serena/
