@@ -543,8 +543,10 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
         { label = _("Comfort"), temp = 22 },
         { label = _("Eco"), temp = 20 },
     }
-    local preset_gap = small_vgap
-    local preset_h = math.max(Screen:scaleBySize(32), (temp_target_h - preset_gap * (#presets - 1)) / #presets)
+    -- A visible gap between pills (rather than the near-zero default span)
+    -- so the three presets read as distinct elements, not one block.
+    local preset_gap = Screen:scaleBySize(8)
+    local preset_h = math.max(Screen:scaleBySize(28), (temp_target_h - preset_gap * (#presets - 1)) / #presets)
     local preset_items = {}
     for i, preset in ipairs(presets) do
         if i > 1 then table.insert(preset_items, VerticalSpan:new{ width = preset_gap }) end
@@ -555,6 +557,8 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
             background = Blitbuffer.COLOR_WHITE,
             bordersize = Size.border.window,
             radius = Screen:scaleBySize(14),
+            padding_h = Size.padding.tiny,
+            padding_v = Size.padding.tiny,
             text_font_face = "cfont",
             text_font_size = 15,
             text_font_bold = true,
@@ -833,7 +837,7 @@ local function buildPowerBadges(settings, states)
         })
     end
     addBadge(TextWidget:new{
-        text = _("Batt"),
+        text = "\u{26A1}",
         face = Font:getFace("cfont", 20),
         fgcolor = Blitbuffer.COLOR_GRAY_5,
     }, battery_text)
@@ -886,9 +890,10 @@ function HaDashboard:init()
     }
     local power_badges = buildPowerBadges(settings, states)
     if power_badges then
-        table.insert(rows, VerticalSpan:new{ width = Size.span.vertical_default })
+        local badges_h = power_badges:getSize().h
+        table.insert(rows, VerticalSpan:new{ width = Screen:scaleBySize(10) })
         table.insert(rows, LeftContainer:new{
-            dimen = { w = content_w, h = Screen:scaleBySize(24) },
+            dimen = { w = content_w, h = badges_h },
             power_badges,
         })
     end
