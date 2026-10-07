@@ -137,6 +137,7 @@ local function fetchAllStates(settings)
     addAll(settings.climate_entities)
     if settings.all_lights_entity then table.insert(entity_ids, settings.all_lights_entity) end
     if settings.weather_entity then table.insert(entity_ids, settings.weather_entity) end
+    if settings.solar_entity then table.insert(entity_ids, settings.solar_entity) end
 
     local states = {}
     for _, entity_id in ipairs(entity_ids) do
@@ -757,7 +758,7 @@ local function buildHeaderSensorBox(settings, states)
     }
 end
 
-local function buildHeader(width, greeting, sensor_box)
+local function buildHeader(width, greeting, sensor_box, solar_pct)
     local height = Screen:scaleBySize(70)
     local left_items = {
         TextWidget:new{
@@ -778,6 +779,23 @@ local function buildHeader(width, greeting, sensor_box)
         face = Font:getFace("cfont", 22),
         fgcolor = Blitbuffer.COLOR_GRAY_5,
     }
+    -- Solar badge goes on its own line under the clock/battery, rather
+    -- than inline, to avoid colliding with the (fairly wide) house chip
+    -- on the left when both sides are near-full width.
+    local right_block = time_text
+    if solar_pct then
+        right_block = VerticalGroup:new{
+            align = "right",
+            time_text,
+            VerticalSpan:new{ width = Size.span.vertical_default },
+            TextWidget:new{
+                text = "\u{2600} " .. solar_pct .. "%",
+                face = Font:getFace("cfont", 20),
+                fgcolor = Blitbuffer.COLOR_GRAY_5,
+            },
+        }
+        height = Screen:scaleBySize(96)
+    end
     return OverlapGroup:new{
         dimen = { w = width, h = height },
         LeftContainer:new{
@@ -786,7 +804,7 @@ local function buildHeader(width, greeting, sensor_box)
         },
         RightContainer:new{
             dimen = { w = width, h = height },
-            time_text,
+            right_block,
         },
     }
 end
@@ -825,8 +843,10 @@ function HaDashboard:init()
     local states = fetchAllStates(settings)
     local forecast = fetchForecast(settings)
     local content_w = self.dimen.w - GUTTER * 2
+    local solar_state = settings.solar_entity and states[settings.solar_entity]
+    local solar_pct = solar_state and round(tonumber(solar_state.state))
     local rows = {
-        buildHeader(content_w, greetingForHour(), buildHeaderSensorBox(settings, states)),
+        buildHeader(content_w, greetingForHour(), buildHeaderSensorBox(settings, states), solar_pct),
     }
 
     table.insert(rows, VerticalSpan:new{ width = GUTTER })
