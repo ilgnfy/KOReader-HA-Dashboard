@@ -46,6 +46,10 @@ return {
     -- Current weather chip, from a weather integration entity.
     weather_entity = "weather.forecast_home",
 
-    -- Optional: shows as a small sun badge next to the clock in the header.
-    solar_entity = nil, -- e.g. "sensor.battery_state_of_charge"
+    -- Optional: a left-aligned row of small power badges under the header
+    -- (home battery %, solar production, house consumption). Leave any of
+    -- them nil to omit that badge.
+    battery_entity = nil, -- e.g. "sensor.battery_state_of_charge"
+    solar_power_entity = nil, -- e.g. "sensor.solar_production"
+    consumption_entity = nil, -- e.g. "sensor.house_consumption"
 }

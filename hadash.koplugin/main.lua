@@ -137,7 +137,9 @@ local function fetchAllStates(settings)
     addAll(settings.climate_entities)
     if settings.all_lights_entity then table.insert(entity_ids, settings.all_lights_entity) end
     if settings.weather_entity then table.insert(entity_ids, settings.weather_entity) end
-    if settings.solar_entity then table.insert(entity_ids, settings.solar_entity) end
+    if settings.battery_entity then table.insert(entity_ids, settings.battery_entity) end
+    if settings.solar_power_entity then table.insert(entity_ids, settings.solar_power_entity) end
+    if settings.consumption_entity then table.insert(entity_ids, settings.consumption_entity) end
 
     local states = {}
     for _, entity_id in ipairs(entity_ids) do
@@ -758,7 +760,7 @@ local function buildHeaderSensorBox(settings, states)
     }
 end
 
-local function buildHeader(width, greeting, sensor_box, solar_pct)
+local function buildHeader(width, greeting, sensor_box)
     local height = Screen:scaleBySize(70)
     local left_items = {
         TextWidget:new{
@@ -779,23 +781,6 @@ local function buildHeader(width, greeting, sensor_box, solar_pct)
         face = Font:getFace("cfont", 22),
         fgcolor = Blitbuffer.COLOR_GRAY_5,
     }
-    -- Solar badge goes on its own line under the clock/battery, rather
-    -- than inline, to avoid colliding with the (fairly wide) house chip
-    -- on the left when both sides are near-full width.
-    local right_block = time_text
-    if solar_pct then
-        right_block = VerticalGroup:new{
-            align = "right",
-            time_text,
-            VerticalSpan:new{ width = Size.span.vertical_default },
-            TextWidget:new{
-                text = "\u{2600} " .. solar_pct .. "%",
-                face = Font:getFace("cfont", 20),
-                fgcolor = Blitbuffer.COLOR_GRAY_5,
-            },
-        }
-        height = Screen:scaleBySize(96)
-    end
     return OverlapGroup:new{
         dimen = { w = width, h = height },
         LeftContainer:new{
@@ -804,9 +789,62 @@ local function buildHeader(width, greeting, sensor_box, solar_pct)
         },
         RightContainer:new{
             dimen = { w = width, h = height },
-            right_block,
+            time_text,
         },
     }
+end
+
+-- Left-aligned row of small power badges: home battery %, solar
+-- production, house consumption. No bundled icon assets exist for
+-- battery/solar, so those use text glyphs; house consumption reuses the
+-- real "home" SVG icon.
+local function buildPowerBadges(settings, states)
+    local function readKw(entity_id)
+        local state = entity_id and states[entity_id]
+        local num = state and tonumber(state.state)
+        if not num then return nil end
+        return string.format("%.1fkW", num)
+    end
+    local function readPct(entity_id)
+        local state = entity_id and states[entity_id]
+        local num = state and tonumber(state.state)
+        if not num then return nil end
+        return round(num) .. "%"
+    end
+
+    local battery_text = readPct(settings.battery_entity)
+    local solar_text = readKw(settings.solar_power_entity)
+    local consumption_text = readKw(settings.consumption_entity)
+    if not (battery_text or solar_text or consumption_text) then return nil end
+
+    local icon_size = Screen:scaleBySize(20)
+    local items = {}
+    local function addBadge(glyph_widget, text)
+        if not text then return end
+        if #items > 0 then
+            table.insert(items, HorizontalSpan:new{ width = Size.span.horizontal_default * 2 })
+        end
+        table.insert(items, glyph_widget)
+        table.insert(items, HorizontalSpan:new{ width = Size.span.horizontal_small })
+        table.insert(items, TextWidget:new{
+            text = text,
+            face = Font:getFace("cfont", 20),
+            fgcolor = Blitbuffer.COLOR_GRAY_5,
+        })
+    end
+    addBadge(TextWidget:new{
+        text = _("Batt"),
+        face = Font:getFace("cfont", 20),
+        fgcolor = Blitbuffer.COLOR_GRAY_5,
+    }, battery_text)
+    addBadge(TextWidget:new{
+        text = "\u{2600}",
+        face = Font:getFace("cfont", 20),
+        fgcolor = Blitbuffer.COLOR_GRAY_5,
+    }, solar_text)
+    addBadge(IconWidget:new{ icon = "home", width = icon_size, height = icon_size, alpha = true }, consumption_text)
+
+    return HorizontalGroup:new(items)
 end
 
 local function greetingForHour()
@@ -843,11 +881,17 @@ function HaDashboard:init()
     local states = fetchAllStates(settings)
     local forecast = fetchForecast(settings)
     local content_w = self.dimen.w - GUTTER * 2
-    local solar_state = settings.solar_entity and states[settings.solar_entity]
-    local solar_pct = solar_state and round(tonumber(solar_state.state))
     local rows = {
-        buildHeader(content_w, greetingForHour(), buildHeaderSensorBox(settings, states), solar_pct),
+        buildHeader(content_w, greetingForHour(), buildHeaderSensorBox(settings, states)),
     }
+    local power_badges = buildPowerBadges(settings, states)
+    if power_badges then
+        table.insert(rows, VerticalSpan:new{ width = Size.span.vertical_default })
+        table.insert(rows, LeftContainer:new{
+            dimen = { w = content_w, h = Screen:scaleBySize(24) },
+            power_badges,
+        })
+    end
 
     table.insert(rows, VerticalSpan:new{ width = GUTTER })
     table.insert(rows, buildWeatherChip(content_w, states[settings.weather_entity], forecast))
