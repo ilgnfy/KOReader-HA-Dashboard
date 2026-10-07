@@ -44,6 +44,13 @@ local RADIUS_TILE = Screen:scaleBySize(20)
 local RADIUS_PILL = Screen:scaleBySize(34)
 local RADIUS_ROUND = Screen:scaleBySize(36) -- +/- circular buttons
 
+-- Robustness (milestone 4): how often to poll HA for state changes made
+-- elsewhere (HA app, another tablet, automations), and how many polls
+-- between a full-screen refresh to clear any e-ink ghosting that's
+-- accumulated from all the partial updates in between.
+local POLL_INTERVAL_S = 30
+local FULL_REFRESH_EVERY_N_POLLS = 10 -- ~5 minutes at the default interval
+
 ----------------------------------------------------------------
 -- HA REST helpers
 ----------------------------------------------------------------
@@ -190,8 +197,27 @@ end
 -- toggle). Only repaints its own rectangle on tap.
 local function buildOnOffTile(settings, light, state, width, height, dashboard_self)
     local is_on = state and state.state == "on"
+    local last_is_on = is_on
     local label = light.label or light.entity
     local card, toggle_btn
+
+    -- Shared by the tap callback and the periodic poller. Returns false on
+    -- a fetch failure (used to drive the stale indicator); skips the
+    -- repaint entirely when nothing actually changed, so a 30s poll of an
+    -- untouched light doesn't flash it on real e-ink for no reason.
+    local function syncFromServer()
+        local new_state = haGet(settings, "/api/states/" .. light.entity)
+        if not new_state then return false end
+        local new_is_on = new_state.state == "on"
+        if new_is_on == last_is_on then return true end
+        last_is_on = new_is_on
+        toggle_btn:setText(new_is_on and _("ON") or _("OFF"), toggle_btn.width)
+        toggle_btn.frame.background = new_is_on and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE
+        toggle_btn.label_widget.fgcolor = new_is_on and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK
+        partialRefresh(dashboard_self, card)
+        return true
+    end
+    table.insert(dashboard_self.poll_fns, syncFromServer)
 
     toggle_btn = Button:new{
         text = is_on and _("ON") or _("OFF"),
@@ -205,14 +231,7 @@ local function buildOnOffTile(settings, light, state, width, height, dashboard_s
         text_font_bold = true,
         callback = function()
             haCallService(settings, "light", "toggle", { entity_id = light.entity })
-            UIManager:scheduleIn(0.4, function()
-                local new_state = haGet(settings, "/api/states/" .. light.entity)
-                local new_is_on = new_state and new_state.state == "on"
-                toggle_btn:setText(new_is_on and _("ON") or _("OFF"), toggle_btn.width)
-                toggle_btn.frame.background = new_is_on and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE
-                toggle_btn.label_widget.fgcolor = new_is_on and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK
-                partialRefresh(dashboard_self, card)
-            end)
+            UIManager:scheduleIn(0.4, syncFromServer)
         end,
     }
     if is_on then whiten(toggle_btn) end
@@ -266,15 +285,23 @@ local function buildDimmableCard(settings, light, state, width, dashboard_self)
     local pct = brightnessPct(state and state.attributes)
     local label = light.label or light.entity
     local card, toggle_btn, pct_text -- forward-declared, wired up below
+    local last_is_on, last_pct = is_on, pct
 
+    -- Shared by the +/-/toggle callbacks and the periodic poller. Returns
+    -- false on fetch failure; skips the repaint when nothing changed.
     local function refreshFromServer()
         local new_state = haGet(settings, "/api/states/" .. light.entity)
-        local new_is_on = new_state and new_state.state == "on"
-        local new_pct = brightnessPct(new_state and new_state.attributes)
+        if not new_state then return false end
+        local new_is_on = new_state.state == "on"
+        local new_pct = brightnessPct(new_state.attributes)
+        if new_is_on == last_is_on and new_pct == last_pct then return true end
+        last_is_on, last_pct = new_is_on, new_pct
         setToggleVisual(toggle_btn, new_is_on, label, Blitbuffer.COLOR_WHITE)
         pct_text:setText(new_pct and (new_pct .. "%") or "—")
         partialRefresh(dashboard_self, card)
+        return true
     end
+    table.insert(dashboard_self.poll_fns, refreshFromServer)
 
     toggle_btn = Button:new{
         text = label .. (is_on and " · ON" or " · OFF"),
@@ -393,6 +420,21 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
 
     local function currentHeater() return heaters[selected] end
 
+    local function computeSignature()
+        local parts = {}
+        for _, h in ipairs(heaters) do
+            local s = heater_states[h.entity]
+            table.insert(parts, s and string.format(
+                "%s|%s|%s",
+                s.state,
+                tostring(s.attributes and s.attributes.current_temperature),
+                tostring(s.attributes and s.attributes.temperature)
+            ) or "nil")
+        end
+        return table.concat(parts, ";")
+    end
+    local last_signature = computeSignature()
+
     local function render()
         local heater = currentHeater()
         local state = heater and heater_states[heater.entity]
@@ -415,13 +457,31 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
         end
     end
 
+    -- Shared by every control in this card and the periodic poller.
+    -- Returns false on fetch failure; skips the repaint when nothing
+    -- changed, and follows whichever heater HA reports as actively
+    -- heating in case it was switched from elsewhere (HA app, automation).
     local function refreshFromServer()
         for _, h in ipairs(heaters) do
-            heater_states[h.entity] = haGet(settings, "/api/states/" .. h.entity)
+            local new_state = haGet(settings, "/api/states/" .. h.entity)
+            if not new_state then return false end
+            heater_states[h.entity] = new_state
         end
+        for i, h in ipairs(heaters) do
+            local s = heater_states[h.entity]
+            if s and s.state == "heat" then
+                selected = i
+                break
+            end
+        end
+        local sig = computeSignature()
+        if sig == last_signature then return true end
+        last_signature = sig
         render()
         partialRefresh(dashboard_self, card)
+        return true
     end
+    table.insert(dashboard_self.poll_fns, refreshFromServer)
 
     local function selectHeater(idx)
         if idx == selected then return end
@@ -785,6 +845,25 @@ local function buildHeader(width, greeting, sensor_box)
         face = Font:getFace("cfont", 22),
         fgcolor = Blitbuffer.COLOR_GRAY_5,
     }
+    -- Stale/offline indicator: empty (zero-ish width) when everything's
+    -- fine, set to a warning glyph by HaDashboard when a poll fails to
+    -- reach HA. Wrapped in its own FrameContainer (not just a bare
+    -- TextWidget) so it has a .dimen to target with a partial refresh.
+    local stale_text = TextWidget:new{
+        text = "",
+        face = Font:getFace("cfont", 20),
+        fgcolor = Blitbuffer.COLOR_GRAY_5,
+    }
+    local stale_frame = FrameContainer:new{
+        bordersize = 0,
+        padding = 0,
+        HorizontalGroup:new{
+            stale_text,
+            HorizontalSpan:new{ width = Size.span.horizontal_small },
+            time_text,
+        },
+    }
+    stale_frame.stale_text = stale_text
     return OverlapGroup:new{
         dimen = { w = width, h = height },
         LeftContainer:new{
@@ -793,9 +872,9 @@ local function buildHeader(width, greeting, sensor_box)
         },
         RightContainer:new{
             dimen = { w = width, h = height },
-            time_text,
+            stale_frame,
         },
-    }
+    }, stale_frame
 end
 
 -- Left-aligned row of small power badges: home battery %, solar
@@ -882,11 +961,16 @@ function HaDashboard:init()
         return
     end
 
+    self.settings = settings
+    self.poll_fns = {} -- populated by builders below; polled every POLL_INTERVAL_S
+
     local states = fetchAllStates(settings)
     local forecast = fetchForecast(settings)
     local content_w = self.dimen.w - GUTTER * 2
+    local header, stale_frame = buildHeader(content_w, greetingForHour(), buildHeaderSensorBox(settings, states))
+    self.stale_frame = stale_frame
     local rows = {
-        buildHeader(content_w, greetingForHour(), buildHeaderSensorBox(settings, states)),
+        header,
     }
     local power_badges = buildPowerBadges(settings, states)
     if power_badges then
@@ -939,7 +1023,19 @@ function HaDashboard:init()
     if settings.all_lights_entity then
         local all_state = states[settings.all_lights_entity]
         local all_on = all_state and all_state.state == "on"
+        local last_all_on = all_on
         local all_btn
+        local function syncAllLights()
+            local new_state = haGet(settings, "/api/states/" .. settings.all_lights_entity)
+            if not new_state then return false end
+            local new_on = new_state.state == "on"
+            if new_on == last_all_on then return true end
+            last_all_on = new_on
+            setToggleVisual(all_btn, new_on, _("All lights"), Blitbuffer.COLOR_WHITE)
+            all_btn:refresh()
+            return true
+        end
+        table.insert(self.poll_fns, syncAllLights)
         all_btn = Button:new{
             text = _("All lights") .. (all_on and " · ON" or " · OFF"),
             width = content_w * 0.28,
@@ -952,11 +1048,7 @@ function HaDashboard:init()
             text_font_bold = true,
             callback = function()
                 haCallService(settings, "light", "toggle", { entity_id = settings.all_lights_entity })
-                UIManager:scheduleIn(0.4, function()
-                    local new_state = haGet(settings, "/api/states/" .. settings.all_lights_entity)
-                    setToggleVisual(all_btn, new_state and new_state.state == "on", _("All lights"), Blitbuffer.COLOR_WHITE)
-                    all_btn:refresh()
-                end)
+                UIManager:scheduleIn(0.4, syncAllLights)
             end,
         }
         if all_on then whiten(all_btn) end
@@ -994,9 +1086,55 @@ function HaDashboard:init()
         padding = GUTTER,
         VerticalGroup:new(rows),
     }
+
+    self:schedulePoll()
+end
+
+-- Shows/clears the header's stale-connection indicator. No-ops if nothing
+-- changed, so a run of consecutive successful (or consecutive failed)
+-- polls doesn't keep re-flashing it.
+function HaDashboard:setStale(is_stale)
+    if is_stale == self._is_stale then return end
+    self._is_stale = is_stale
+    if not self.stale_frame then return end
+    self.stale_frame.stale_text:setText(is_stale and _("\u{26A0} Offline") or "")
+    partialRefresh(self, self.stale_frame)
+end
+
+function HaDashboard:schedulePoll()
+    UIManager:scheduleIn(POLL_INTERVAL_S, function()
+        if self._closed then return end
+        self:runPoll()
+    end)
+end
+
+-- Periodic tick (milestone 4, "robustness"): re-checks every entity this
+-- dashboard shows and repaints only the tiles whose value actually
+-- changed (each poll_fn is the same sync function its widget's own tap
+-- callback uses, which already diffs before repainting). Every Nth tick
+-- instead does a full dashboard rebuild, which forces a real full-screen
+-- refresh -- on e-ink that's what clears the ghosting that accumulates
+-- from all the partial updates in between.
+function HaDashboard:runPoll()
+    if self._closed then return end
+    self._poll_count = (self._poll_count or 0) + 1
+    if self._poll_count % FULL_REFRESH_EVERY_N_POLLS == 0 then
+        self._closed = true
+        UIManager:close(self)
+        UIManager:show(HaDashboard:new{})
+        return
+    end
+    local any_failed = false
+    for _, fn in ipairs(self.poll_fns) do
+        local ok = fn()
+        if ok == false then any_failed = true end
+    end
+    self:setStale(any_failed)
+    self:schedulePoll()
 end
 
 function HaDashboard:onClose()
+    self._closed = true
     UIManager:close(self)
     return true
 end
