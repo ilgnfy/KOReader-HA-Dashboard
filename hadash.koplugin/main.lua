@@ -27,11 +27,11 @@ local _ = require("gettext")
 -- Without this, a request that hangs instead of failing fast (brief Wi-Fi
 -- blip, HA momentarily unreachable) blocks KOReader's single Lua thread
 -- -- and thus all touch input -- for whatever LuaSocket's own default
--- timeout is. fetchAllStates's fallback path can do up to a dozen or so
--- of these sequentially, so an unbounded hang here multiplies into
--- several minutes of a fully frozen UI. 5s caps the worst case per
--- request; a real LAN round-trip to HA is milliseconds.
-http.TIMEOUT = 5
+-- timeout is. A real LAN round-trip to HA is milliseconds, so 3s is
+-- already generous; combined with fetchAllStates's fallback loop now
+-- aborting after the first connection-level failure (see haGet), this
+-- caps a real network-down UI freeze at ~3s instead of multiple minutes.
+http.TIMEOUT = 3
 
 -- Config lives outside the plugin folder so redeploying the plugin never
 -- touches credentials. See config.sample.lua in the project root.
@@ -80,7 +80,15 @@ local function haGet(settings, path)
         if decode_ok then return decoded end
     end
     logger.warn("hadash: GET failed", path, ok, code)
-    return nil
+    -- Second return is only set for a connection-level failure (ok falsy
+    -- -- "Network is unreachable", a timeout, DNS failure, etc, where
+    -- `code` is LuaSocket's error string, not an HTTP status). An HTTP-
+    -- level failure (ok truthy, e.g. a 401) is per-request and doesn't
+    -- mean every other entity will fail the same way, so callers looping
+    -- over several entities can use this to stop early only on the
+    -- former -- no point burning a full timeout on each remaining entity
+    -- when the network itself is down for all of them alike.
+    return nil, (not ok) and code or nil
 end
 
 -- Used by the periodic poller's tile-refresh closures: during a poll tick
@@ -208,7 +216,18 @@ local function fetchAllStates(settings)
 
     local states = {}
     for _, entity_id in ipairs(entity_ids) do
-        states[entity_id] = haGet(settings, "/api/states/" .. entity_id)
+        local state, conn_err = haGet(settings, "/api/states/" .. entity_id)
+        states[entity_id] = state
+        if conn_err then
+            -- Network itself is down (not just this one entity) -- every
+            -- remaining GET in this loop would hit the same failure, so
+            -- stop here instead of burning a full http.TIMEOUT on each of
+            -- them in turn. This is what previously turned a single 5s
+            -- timeout into a multi-dozen-second UI freeze on a real Wi-Fi
+            -- blip (fetchAllStates can cover a dozen-plus entities).
+            logger.warn("hadash: connection-level failure, aborting remaining GETs", conn_err)
+            break
+        end
     end
     return states
 end
