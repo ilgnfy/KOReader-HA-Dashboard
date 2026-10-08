@@ -41,6 +41,7 @@ Portrait screen, white background, no shadows or gradients.
 3. ✅ Full grid in the agreed design (lights, dimmable bulbs, scenes, climate with heater selector, weather, power/sensor badges).
 4. ✅ Robustness: periodic polling (diff-and-redraw-only-changed-tiles), stale/offline indicator, periodic full refresh against ghosting. Deployed and running on real hardware with boot autostart.
 5. Polish: refresh modes tuned on the real panel (ongoing), icons, bundled font. Not started.
+6. (Backlog, V1.1, not started) On-screen brightness slider for dimmable lights, replacing the -/+ buttons. KOReader has a slider widget and the Kindle's touch/e-ink can drive one (laggy but workable). Needs an architecture change first: current tiles wait for the HA round-trip response before redrawing; a slider needs the opposite -- redraw immediately on drag/release, then reconcile against HA's actual reported state shortly after (and correct the slider position if they disagree). Deferred until the current real-device setup is stable.
 
 ## Testing
 
@@ -54,6 +55,46 @@ KOReader desktop emulator on the Mac: `./kodev build` then `./kodev run -w=1072 
 - KOReader install after jailbreak: `;kpm update`, then `;kpm install koreader`.
 - Items marked "to test" in the plan (sleep/Wi-Fi keep-alive, startup-hook behavior, KOReader menu names) are not verified.
 
+## Incident postmortem (SSH_autostart edit, factory-reset recovery)
+
+An attempt to make `SSH_autostart` persistent triggered a blank-screen/
+crash-loop requiring several `DO_FACTORY_RESTORE` cycles. Root-caused via
+UART/bist diagnostics during recovery:
+
+1. **Killed the only remote-access path from inside itself.** SSH runs
+   inside KOReader's own Lua process (`SSH.koplugin`). A `kill -9` aimed
+   at KOReader while testing upstart respawn behavior also killed the SSH
+   server sharing that process — remote access was lost mid-edit, before
+   `koreader-autostart.conf` could be restored.
+2. **Wrong assumption about `KPPMainApp`.** Disabled on the belief it was
+   "just the Store/Aa-menu app." It's actually load-bearing for native UI
+   rendering; disabling it, combined with the broken autostart job from
+   (1), left the device unable to render anything at all, native or
+   KOReader.
+3. The `cvm`-killing kill-loop itself was not implicated, nor was
+   disabling `statusbar.conf` — both tested clean across many reboots
+   before the incident.
+
+Lesson: never cut your only remote-access path mid-edit with no fallback,
+and don't disable a component whose role you haven't actually verified —
+even one that looks safe in isolation. The real-device setup below was
+rebuilt deliberately more conservative as a result: only the proven-safe
+`statusbar.conf` disable is kept; `kppmainapp.conf` is left enabled; the
+`cvm`/native-process kill-loop is dropped entirely (power/CPU saving only,
+not worth the added risk for now).
+
+Separately (unrelated to the above): `KPPMainAppV2` was found to
+crash-loop several times (visible as a blank screen + "die ausgewählte
+Anwendung konnte nicht gestartet werden" error, and crash dumps cluttering
+`/mnt/us/documents/` — the native library folder) before eventually
+recovering on its own. Confirmed present even on a from-scratch factory
+reset with zero trace of any jailbreak/upstart edits, and independent of
+Wi-Fi/internet access — a pre-existing stock-firmware/storage issue on
+this specific unit, not something our setup causes. Crash dump files
+(`KPPMainAppV2_*_crash_*.{tgz,txt,sdr}`) can be deleted straight out of
+`/mnt/us/documents/` if they clutter the library; they're not needed once
+triaged.
+
 ## Real-device setup (Kindle PW3, WinterBreak 2)
 
 Verified working end-to-end, survives reboot.
@@ -61,14 +102,78 @@ Verified working end-to-end, survives reboot.
 - **SSH**: KOReader's SSH.koplugin, port **2222** (not 22). Must be started by hand once per cold boot unless `autostart` is set -- the plugin reads that from `settings.reader.lua` at its own init, so toggling it live via httpinspector doesn't persist; it must be edited into the file directly (remount `/` rw first, see below) while KOReader is stopped, or saved through the plugin's own UI flow.
 - **Root filesystem**: `/` is read-only by default (`ext3 ro`). `mount -o remount,rw /` to edit `/etc/upstart/*`, `mount -o remount,ro /` after. `/mnt/us` (KOReader's own install/settings) is writable directly, no remount needed.
 - **httpinspector** (port 8080, `httpinspector.koplugin`, `autostart=true` in settings): invaluable for remote debugging without SSH -- browses and calls live Lua objects over HTTP (e.g. `GET /koreader/device/screen/bb` for a live screenshot, `GET /koreader/UIManager/_window_stack/` for the active widget tree). Never used it to run arbitrary shell commands or write files (`os.execute`/`io.*`) -- that's a real RCE surface on an unauthenticated endpoint; stuck to the plugins' own exposed methods (`start()`, `stop()`, field toggles) only.
-- **Boot autostart** (`/etc/upstart/koreader-autostart.conf`, `start on framework_ready`, `respawn`, `exec /mnt/us/documents/KOReader.sh --framework_stop`): launches straight to the dashboard (`auto_open = true` in `hadash_settings.lua`; the plugin guards this with a module-level flag so it only fires once per process, since KOReader reinstantiates plugins on every FileManager/Reader switch, not just at boot).
-- **`--framework_stop` doesn't fully suppress Amazon's stack.** Confirmed still running under it: `JunoStatusBarDriver` (native status bar -- visually collided with our header), `KPPMainApp` (Kindle Store/Aa-menu), and the big `cvm` Java VM (the entire native reader app -- store, Whispersync, X-Ray, ads; heaviest single process). None of this is needed for a dashboard appliance and the device sits on a no-internet Wi-Fi anyway, so the network-dependent ones (sync, store, telemetry) can't do anything even if left running.
-  - `statusbar.conf` and `kppmainapp.conf` are independent upstart jobs (don't emit `framework_ready`, safe to disable outright): renamed to `*.disabled` under `/etc/upstart/`.
-  - `cvm` is launched directly inside Amazon's own `framework.conf` script -- deliberately did not hand-edit that file, since `framework_setup.conf` (which emits `framework_ready`, our own boot trigger's dependency) only starts after `framework.conf` itself starts. Instead, `koreader-autostart.conf` has a `post-start script` that polls every 2s for up to 60s and kills `cvm`/`whisperstore`/`KindleContentDownloadManagerApplication`/`fastmetrics`/`contentpackd`/`pillowd` as they appear. A short fixed delay (8s) was tried first and missed `cvm`, which spawns partway through `framework.conf`'s own (fairly long) startup script -- polling was needed.
-  - Deliberately left alone: `wifid`, `powerd`, `deviced`, `dpmd`, `wand`, `mcsd`, `appmgrd`, `perfd`, `dynconfig`, `demd`, `lipc-daemon`, `dbus-daemon`, `udevd`, `syslog-ng`, `crond` -- core power/network/IPC management, didn't find a confident basis for touching these.
-- **Official Amazon kill-switch exists**: `/mnt/us/DONT_START_FRAMEWORK` (checked in `framework.conf`'s `pre-start script`) skips the whole framework/cvm stack from the start. Not used here because it also skips `framework_ready`, breaking our own boot trigger. The cleaner long-term fix (not done): retrigger our autostart off an earlier, framework-independent upstart event, then this flag becomes safe to use for maximum savings. More testing/reboot iterations required; the current post-start-kill approach was lower-risk to validate incrementally.
+- **Boot autostart, current version** (`/etc/upstart/koreader-autostart.conf`):
+  ```
+  start on mounted_userstore
+  respawn
+  normal exit 0
+
+  exec /mnt/us/documents/KOReader.sh --framework_stop
+  ```
+  Superseded the earlier `framework_ready`-triggered version (and its
+  `post-start script` kill-loop targeting `cvm`/`KPPMainApp`/etc) after
+  that kill-loop tripped a firmware-level watchdog (repeatedly `kill -9`ing
+  live processes on a 2s cycle reads to Amazon's own stack as instability
+  and force-reboots -- a real, different failure mode from the earlier
+  SSH_autostart incident, discovered the hard way via another reboot
+  loop). Fixed by never starting those processes in the first place
+  instead of starting-then-killing them (see below) -- upstart's own
+  dependency graph (read directly off the device via
+  `grep -E "^start on|^emits|^stop on" /etc/upstart/*.conf`, not guessed)
+  showed `framework_ready` depends on `lab126_gui` having started first;
+  disabling `lab126_gui.conf` breaks that whole chain, so `framework_ready`
+  never fires -- hence the retrigger onto `mounted_userstore` (a pure
+  filesystem-mount event, fires well before `lab126_gui`/network even
+  start; Wi-Fi/power daemons hang off a separate `lab126` base job,
+  confirmed unaffected).
+  `auto_open = true` in `hadash_settings.lua` still launches straight to
+  the dashboard (module-level flag guard against KOReader reinstantiating
+  plugins on every FileManager/Reader switch). `normal exit 0` still lets
+  a deliberate "Exit" fall through to native UI without instant respawn,
+  though native UI doesn't fully work anymore now that `lab126_gui` is
+  disabled (see below) -- traded off deliberately since native reading
+  on this device was dropped as a requirement.
+- **Disabled outright (never start, nothing to crash/watchdog-trip)**:
+  `lab126_gui.conf` -- transitively prevents `cvm`, `KPPMainApp`,
+  `JunoStatusBarDriver`/`statusbar.conf`, `whisperstore`, `kfxreader`/
+  `kfxview`, `progressivedownloads`, `webreader`, and everything else
+  hanging off `framework_ready` or `started lab126_gui`, via upstart's
+  own dependency graph -- zero kills needed. Also `wand.conf` (WAN/
+  cellular modem daemon, separate job from `wifid`/Wi-Fi -- this is a 3G
+  model Kindle, "Edge" network indicator was this daemon trying to
+  register; disabling it is pure power saving, Wi-Fi unaffected).
+  `statusbar.conf`/`kppmainapp.conf` were already independently disabled
+  before `lab126_gui` was, now redundant but left as-is.
+- **Flags set**: `/mnt/us/DONT_START_FRAMEWORK` (Amazon's own
+  `framework.conf` `pre-start script` check, belt-and-suspenders with
+  `lab126_gui` being disabled) and `/mnt/us/DISABLE_CORE_DUMP` (stops
+  Amazon's crash-dump generator from littering `/mnt/us/documents/` --
+  the native library folder -- with `KPPMainAppV2_*_crash_*` files every
+  time something in the stack fails to start).
+- **KPPMainAppV2 crash-loops on its own on this unit**, independent of
+  any of the above: confirmed via `/mnt/us/koreader/crash.log` timestamps
+  spanning a full ~8 hours overnight, ~29 crash dumps, regardless of
+  Wi-Fi/internet state. Pre-existing stock-firmware/storage instability on
+  this specific device, not caused by this project's changes -- the
+  `lab126_gui` disable above sidesteps it entirely rather than fixing it.
 - **USB mass storage**: didn't get this working with `--framework_stop` + `respawn` active (KOReader never released long enough, and native services it may depend on could be among those stopped). Likely needs the autostart job paused first (rename `koreader-autostart.conf` to `.disabled`, reboot, do the USB transfer, restore, reboot again) -- not tried end-to-end.
 - Deploy flow in practice: `./deploy.sh <ip>` (now takes an optional 3rd arg for SSH port, defaults to 2222) copies the plugin and restarts KOReader; `scp -P 2222 ... hadash_settings.lua` separately for config (never committed, same as the emulator's copy).
+- **HTTP requests have an explicit 5s timeout** (`http.TIMEOUT = 5` in
+  `main.lua`) -- without it, a request that hangs instead of failing fast
+  (brief Wi-Fi blip) blocks KOReader's single Lua thread, and thus all
+  touch input, for whatever LuaSocket's own default is. Confirmed in
+  practice: a ~6-minute full UI freeze traced to exactly this, since the
+  periodic poll's fallback path can do over a dozen sequential requests
+  when the combined-fetch optimization below isn't available.
+- **`/api/template` (the combined-fetch optimization) returns 401** on
+  this HA setup -- likely because the long-lived token's user is
+  deliberately non-admin (per the original plan), and HA restricts
+  template rendering to admin-level tokens while plain
+  `/api/states/<entity>` GETs work for any authenticated user. Falls back
+  automatically to one GET per entity (same as before the optimization
+  existed) -- not broken, just not activating. Not fixed (would mean
+  granting the token's user admin rights, a real security trade-off,
+  deliberately not made).
 
 ## Open inputs needed from the user
 

@@ -24,6 +24,15 @@ local ltn12 = require("ltn12")
 local logger = require("logger")
 local _ = require("gettext")
 
+-- Without this, a request that hangs instead of failing fast (brief Wi-Fi
+-- blip, HA momentarily unreachable) blocks KOReader's single Lua thread
+-- -- and thus all touch input -- for whatever LuaSocket's own default
+-- timeout is. fetchAllStates's fallback path can do up to a dozen or so
+-- of these sequentially, so an unbounded hang here multiplies into
+-- several minutes of a fully frozen UI. 5s caps the worst case per
+-- request; a real LAN round-trip to HA is milliseconds.
+http.TIMEOUT = 5
+
 -- Config lives outside the plugin folder so redeploying the plugin never
 -- touches credentials. See config.sample.lua in the project root.
 local SETTINGS_PATH = DataStorage:getDataDir() .. "/hadash_settings.lua"
@@ -48,8 +57,8 @@ local RADIUS_ROUND = Screen:scaleBySize(36) -- +/- circular buttons
 -- elsewhere (HA app, another tablet, automations), and how many polls
 -- between a full-screen refresh to clear any e-ink ghosting that's
 -- accumulated from all the partial updates in between.
-local POLL_INTERVAL_S = 30
-local FULL_REFRESH_EVERY_N_POLLS = 10 -- ~5 minutes at the default interval
+local POLL_INTERVAL_S = 60
+local FULL_REFRESH_EVERY_N_POLLS = 10 -- ~10 minutes at the default interval
 
 ----------------------------------------------------------------
 -- HA REST helpers
@@ -72,6 +81,17 @@ local function haGet(settings, path)
     end
     logger.warn("hadash: GET failed", path, ok, code)
     return nil
+end
+
+-- Used by the periodic poller's tile-refresh closures: during a poll tick
+-- dashboard_self._poll_cache holds one combined fetchAllStates() result
+-- for every entity, so individual tiles don't each do their own GET.
+-- Outside a poll tick (e.g. the 0.4s re-check right after a tap) the cache
+-- is nil and this just falls through to a fresh single-entity GET.
+local function haGetCached(dashboard_self, settings, entity_id)
+    local cache = dashboard_self and dashboard_self._poll_cache
+    if cache and cache[entity_id] ~= nil then return cache[entity_id] end
+    return haGet(settings, "/api/states/" .. entity_id)
 end
 
 local function haCallService(settings, domain, service, payload)
@@ -133,6 +153,11 @@ local function fetchForecast(settings)
     return forecast_list and forecast_list[1] or nil
 end
 
+-- One combined fetch for every entity the dashboard shows, instead of one
+-- GET per entity -- cuts N HTTP round-trips (and N Wi-Fi radio wake
+-- windows per poll) down to 1. Uses HA's templating API to build a JSON
+-- map of entity_id -> {state, attributes} server-side; only state and
+-- attributes are ever read anywhere in this file, so that's all we ask for.
 local function fetchAllStates(settings)
     local entity_ids = {}
     local function addAll(list)
@@ -147,6 +172,39 @@ local function fetchAllStates(settings)
     if settings.battery_entity then table.insert(entity_ids, settings.battery_entity) end
     if settings.solar_power_entity then table.insert(entity_ids, settings.solar_power_entity) end
     if settings.consumption_entity then table.insert(entity_ids, settings.consumption_entity) end
+    if #entity_ids == 0 then return {} end
+
+    local quoted_ids = {}
+    for _, id in ipairs(entity_ids) do table.insert(quoted_ids, string.format("%q", id)) end
+    local template = string.format([[
+{%% set ns = namespace(result={}) %%}
+{%% for eid in [%s] %%}
+{%% set st = states[eid] %%}
+{%% if st %%}
+{%% set ns.result = ns.result | combine({eid: {'state': st.state, 'attributes': st.attributes | dict}}) %%}
+{%% endif %%}
+{%% endfor %%}
+{{ ns.result | tojson }}
+]], table.concat(quoted_ids, ", "))
+
+    local body = JSON.encode({ template = template })
+    local resp_body = {}
+    local ok, code = http.request{
+        url = settings.ha_url .. "/api/template",
+        method = "POST",
+        headers = {
+            ["Authorization"] = "Bearer " .. settings.ha_token,
+            ["Content-Type"] = "application/json",
+            ["Content-Length"] = tostring(#body),
+        },
+        source = ltn12.source.string(body),
+        sink = ltn12.sink.table(resp_body),
+    }
+    if ok and code == 200 then
+        local decode_ok, decoded = pcall(JSON.decode, table.concat(resp_body))
+        if decode_ok and type(decoded) == "table" then return decoded end
+    end
+    logger.warn("hadash: template fetch failed, falling back to per-entity GET", ok, code)
 
     local states = {}
     for _, entity_id in ipairs(entity_ids) do
@@ -206,7 +264,7 @@ local function buildOnOffTile(settings, light, state, width, height, dashboard_s
     -- repaint entirely when nothing actually changed, so a 30s poll of an
     -- untouched light doesn't flash it on real e-ink for no reason.
     local function syncFromServer()
-        local new_state = haGet(settings, "/api/states/" .. light.entity)
+        local new_state = haGetCached(dashboard_self, settings, light.entity)
         if not new_state then return false end
         local new_is_on = new_state.state == "on"
         if new_is_on == last_is_on then return true end
@@ -230,8 +288,17 @@ local function buildOnOffTile(settings, light, state, width, height, dashboard_s
         text_font_size = 16,
         text_font_bold = true,
         callback = function()
+            -- Pending feedback: show the command was registered immediately
+            -- (grey), independent of how long HA actually takes to confirm
+            -- it -- then the 0.4s resync below settles it to the real
+            -- black/white once that confirmation (or failure) comes back.
+            toggle_btn.frame.background = Blitbuffer.COLOR_GRAY_5
+            partialRefresh(dashboard_self, card)
             haCallService(settings, "light", "toggle", { entity_id = light.entity })
-            UIManager:scheduleIn(0.4, syncFromServer)
+            UIManager:scheduleIn(0.4, function()
+                syncFromServer()
+                dashboard_self:refreshHeaderBadges()
+            end)
         end,
     }
     if is_on then whiten(toggle_btn) end
@@ -290,7 +357,7 @@ local function buildDimmableCard(settings, light, state, width, dashboard_self)
     -- Shared by the +/-/toggle callbacks and the periodic poller. Returns
     -- false on fetch failure; skips the repaint when nothing changed.
     local function refreshFromServer()
-        local new_state = haGet(settings, "/api/states/" .. light.entity)
+        local new_state = haGetCached(dashboard_self, settings, light.entity)
         if not new_state then return false end
         local new_is_on = new_state.state == "on"
         local new_pct = brightnessPct(new_state.attributes)
@@ -314,8 +381,13 @@ local function buildDimmableCard(settings, light, state, width, dashboard_self)
         text_font_size = 20,
         text_font_bold = true,
         callback = function()
+            toggle_btn.frame.background = Blitbuffer.COLOR_GRAY_5
+            partialRefresh(dashboard_self, card)
             haCallService(settings, "light", "toggle", { entity_id = light.entity })
-            UIManager:scheduleIn(0.4, refreshFromServer)
+            UIManager:scheduleIn(0.4, function()
+                refreshFromServer()
+                dashboard_self:refreshHeaderBadges()
+            end)
         end,
     }
     if is_on then whiten(toggle_btn) end
@@ -326,7 +398,10 @@ local function buildDimmableCard(settings, light, state, width, dashboard_self)
                 entity_id = light.entity,
                 brightness_step_pct = delta,
             })
-            UIManager:scheduleIn(0.4, refreshFromServer)
+            UIManager:scheduleIn(0.4, function()
+                refreshFromServer()
+                dashboard_self:refreshHeaderBadges()
+            end)
         end
     end
 
@@ -468,7 +543,7 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
     -- heating in case it was switched from elsewhere (HA app, automation).
     local function refreshFromServer()
         for _, h in ipairs(heaters) do
-            local new_state = haGet(settings, "/api/states/" .. h.entity)
+            local new_state = haGetCached(dashboard_self, settings, h.entity)
             if not new_state then return false end
             heater_states[h.entity] = new_state
         end
@@ -559,11 +634,16 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
             if not heater then return end
             local state = heater_states[heater.entity]
             local is_heat = state and state.state == "heat"
+            heat_btn.frame.background = Blitbuffer.COLOR_GRAY_5
+            partialRefresh(dashboard_self, card)
             haCallService(settings, "climate", "set_hvac_mode", {
                 entity_id = heater.entity,
                 hvac_mode = is_heat and "off" or "heat",
             })
-            UIManager:scheduleIn(0.4, refreshFromServer)
+            UIManager:scheduleIn(0.4, function()
+                refreshFromServer()
+                dashboard_self:refreshHeaderBadges()
+            end)
         end,
     }
     if initial_is_heat then whiten(heat_btn) end
@@ -580,7 +660,10 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
                 entity_id = heater.entity,
                 temperature = target + sign * step,
             })
-            UIManager:scheduleIn(0.4, refreshFromServer)
+            UIManager:scheduleIn(0.4, function()
+                refreshFromServer()
+                dashboard_self:refreshHeaderBadges()
+            end)
         end
     end
 
@@ -635,7 +718,10 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
                     temperature = preset.temp,
                     hvac_mode = "heat",
                 })
-                UIManager:scheduleIn(0.4, refreshFromServer)
+                UIManager:scheduleIn(0.4, function()
+                refreshFromServer()
+                dashboard_self:refreshHeaderBadges()
+            end)
             end,
         })
     end
@@ -805,7 +891,12 @@ local function buildHeaderSensorBox(settings, states)
     if #parts == 0 then return nil end
 
     local icon_size = Screen:scaleBySize(26)
-    return FrameContainer:new{
+    local text_widget = TextWidget:new{
+        text = table.concat(parts, " · "),
+        face = Font:getFace("cfont", 20),
+        fgcolor = Blitbuffer.COLOR_BLACK,
+    }
+    local box = FrameContainer:new{
         background = GRAY_FILL,
         bordersize = Size.border.window,
         radius = RADIUS_PILL,
@@ -820,13 +911,11 @@ local function buildHeaderSensorBox(settings, states)
             -- white box here since this chip's background is gray).
             IconWidget:new{ icon = "home", width = icon_size, height = icon_size, alpha = true },
             HorizontalSpan:new{ width = Size.span.horizontal_small },
-            TextWidget:new{
-                text = table.concat(parts, " · "),
-                face = Font:getFace("cfont", 20),
-                fgcolor = Blitbuffer.COLOR_BLACK,
-            },
+            text_widget,
         },
     }
+    box.text_widget = text_widget
+    return box
 end
 
 local function buildHeader(width, greeting, sensor_box, exit_callback)
@@ -885,6 +974,7 @@ local function buildHeader(width, greeting, sensor_box, exit_callback)
         },
     }
     stale_frame.stale_text = stale_text
+    stale_frame.time_text = time_text
     return OverlapGroup:new{
         dimen = { w = width, h = height },
         LeftContainer:new{
@@ -923,32 +1013,37 @@ local function buildPowerBadges(settings, states)
 
     local icon_size = Screen:scaleBySize(20)
     local items = {}
-    local function addBadge(glyph_widget, text)
+    local text_widgets = {}
+    local function addBadge(key, glyph_widget, text)
         if not text then return end
         if #items > 0 then
             table.insert(items, HorizontalSpan:new{ width = Size.span.horizontal_default * 2 })
         end
         table.insert(items, glyph_widget)
         table.insert(items, HorizontalSpan:new{ width = Size.span.horizontal_small })
-        table.insert(items, TextWidget:new{
+        local text_widget = TextWidget:new{
             text = text,
             face = Font:getFace("cfont", 20),
             fgcolor = Blitbuffer.COLOR_GRAY_5,
-        })
+        }
+        text_widgets[key] = text_widget
+        table.insert(items, text_widget)
     end
-    addBadge(TextWidget:new{
+    addBadge("battery", TextWidget:new{
         text = "\u{26A1}",
         face = Font:getFace("cfont", 20),
         fgcolor = Blitbuffer.COLOR_GRAY_5,
     }, battery_text)
-    addBadge(TextWidget:new{
+    addBadge("solar", TextWidget:new{
         text = "\u{2600}",
         face = Font:getFace("cfont", 20),
         fgcolor = Blitbuffer.COLOR_GRAY_5,
     }, solar_text)
-    addBadge(IconWidget:new{ icon = "home", width = icon_size, height = icon_size, alpha = true }, consumption_text)
+    addBadge("consumption", IconWidget:new{ icon = "home", width = icon_size, height = icon_size, alpha = true }, consumption_text)
 
-    return HorizontalGroup:new(items)
+    local group = HorizontalGroup:new(items)
+    group.text_widgets = text_widgets
+    return group
 end
 
 local function greetingForHour()
@@ -988,7 +1083,9 @@ function HaDashboard:init()
     local states = fetchAllStates(settings)
     local forecast = fetchForecast(settings)
     local content_w = self.dimen.w - GUTTER * 2
-    local header, stale_frame = buildHeader(content_w, greetingForHour(), buildHeaderSensorBox(settings, states), function()
+    local sensor_box = buildHeaderSensorBox(settings, states)
+    self.sensor_box = sensor_box
+    local header, stale_frame = buildHeader(content_w, greetingForHour(), sensor_box, function()
         UIManager:close(self)
     end)
     self.stale_frame = stale_frame
@@ -996,6 +1093,7 @@ function HaDashboard:init()
         header,
     }
     local power_badges = buildPowerBadges(settings, states)
+    self.power_badges = power_badges
     if power_badges then
         local badges_h = power_badges:getSize().h
         table.insert(rows, VerticalSpan:new{ width = Screen:scaleBySize(10) })
@@ -1049,7 +1147,7 @@ function HaDashboard:init()
         local last_all_on = all_on
         local all_btn
         local function syncAllLights()
-            local new_state = haGet(settings, "/api/states/" .. settings.all_lights_entity)
+            local new_state = haGetCached(self, settings, settings.all_lights_entity)
             if not new_state then return false end
             local new_on = new_state.state == "on"
             if new_on == last_all_on then return true end
@@ -1070,8 +1168,10 @@ function HaDashboard:init()
             text_font_size = 20,
             text_font_bold = true,
             callback = function()
+                all_btn.frame.background = Blitbuffer.COLOR_GRAY_5
+                all_btn:refresh()
                 haCallService(settings, "light", "toggle", { entity_id = settings.all_lights_entity })
-                UIManager:scheduleIn(0.4, syncAllLights)
+                UIManager:scheduleIn(0.4, function() self:refreshAllTiles() end)
             end,
         }
         if all_on then whiten(all_btn) end
@@ -1084,14 +1184,16 @@ function HaDashboard:init()
             if #action_items > 0 then
                 table.insert(action_items, HorizontalSpan:new{ width = GUTTER })
             end
-            -- Fire-and-forget: scenes have no on/off state to reflect back,
-            -- so there's nothing to repaint after activating one.
+            -- Scenes have no on/off state of their own, but typically
+            -- change several OTHER entities (lights, etc.) at once, so
+            -- refresh everything shortly after activating one.
             table.insert(action_items, buildPillButton{
                 text = scene.label or scene.entity,
                 width = scene_w,
                 background = GRAY_FILL,
                 callback = function()
                     haCallService(settings, "scene", "turn_on", { entity_id = scene.entity })
+                    UIManager:scheduleIn(0.4, function() self:refreshAllTiles() end)
                 end,
             })
         end
@@ -1110,7 +1212,17 @@ function HaDashboard:init()
         VerticalGroup:new(rows),
     }
 
-    self:schedulePoll()
+    -- One early retry a few seconds after init instead of waiting a full
+    -- POLL_INTERVAL_S: at boot, this dashboard can launch before Wi-Fi has
+    -- actually associated (autostart now triggers on an event earlier
+    -- than the native network daemon), so the very first fetch above may
+    -- have failed outright with every tile left blank/stale. runPoll's
+    -- own tail call re-establishes the normal POLL_INTERVAL_S cadence
+    -- from here, so this is a one-time catch-up, not a tighter loop.
+    UIManager:scheduleIn(5, function()
+        if self._closed then return end
+        self:runPoll()
+    end)
 end
 
 -- Shows/clears the header's stale-connection indicator. No-ops if nothing
@@ -1125,19 +1237,110 @@ function HaDashboard:setStale(is_stale)
 end
 
 function HaDashboard:schedulePoll()
-    UIManager:scheduleIn(POLL_INTERVAL_S, function()
+    -- Stored on self (not a bare inline closure) so onClose can cancel it
+    -- outright via UIManager:unschedule -- the _closed flag already stops
+    -- the chain from continuing on its own, but this removes the queued
+    -- tick immediately instead of waiting for it to fire and no-op.
+    self._poll_task = function()
         if self._closed then return end
         self:runPoll()
-    end)
+    end
+    UIManager:scheduleIn(POLL_INTERVAL_S, self._poll_task)
 end
 
--- Periodic tick (milestone 4, "robustness"): re-checks every entity this
--- dashboard shows and repaints only the tiles whose value actually
--- changed (each poll_fn is the same sync function its widget's own tap
--- callback uses, which already diffs before repainting). Every Nth tick
--- instead does a full dashboard rebuild, which forces a real full-screen
--- refresh -- on e-ink that's what clears the ghosting that accumulates
--- from all the partial updates in between.
+-- Cheap, standalone refresh of just the header sensor chip and power
+-- badges (temp/humidity/battery/solar/consumption -- a handful of
+-- entities at most), independent of the much heavier fetchAllStates/
+-- poll_fns loop. Safe to call after every single tap (unlike
+-- refreshAllTiles, which can be a dozen-plus sequential HTTP round-trips
+-- and visibly freezes input if called that often) so these badges stay
+-- current regardless of which control was touched.
+function HaDashboard:refreshHeaderBadges()
+    if self._closed then return end
+    local settings = self.settings
+    local any_failed = false
+    if self.sensor_box and settings.sensors then
+        local parts = {}
+        for _, sensor in ipairs(settings.sensors) do
+            local state = haGetCached(self, settings, sensor.entity)
+            if not state then
+                any_failed = true
+            else
+                local value = state.state
+                if value and value ~= "unavailable" and value ~= "unknown" then
+                    local num = tonumber(value)
+                    table.insert(parts, string.format("%s%s", num and round(num) or value, sensor.unit or ""))
+                end
+            end
+        end
+        local new_text = table.concat(parts, " · ")
+        if new_text ~= self._last_sensor_text then
+            self._last_sensor_text = new_text
+            self.sensor_box.text_widget:setText(new_text)
+            partialRefresh(self, self.sensor_box)
+        end
+    end
+    if self.power_badges and self.power_badges.text_widgets then
+        local function readKw(entity_id)
+            local state = entity_id and haGetCached(self, settings, entity_id)
+            local num = state and tonumber(state.state)
+            if not num then return nil end
+            return string.format("%.1fkW", num)
+        end
+        local function readPct(entity_id)
+            local state = entity_id and haGetCached(self, settings, entity_id)
+            local num = state and tonumber(state.state)
+            if not num then return nil end
+            return round(num) .. "%"
+        end
+        local tw = self.power_badges.text_widgets
+        local function updateBadge(key, text)
+            if tw[key] and text and text ~= self["_last_" .. key .. "_text"] then
+                self["_last_" .. key .. "_text"] = text
+                tw[key]:setText(text)
+                partialRefresh(self, self.power_badges)
+            end
+        end
+        updateBadge("battery", readPct(settings.battery_entity))
+        updateBadge("solar", readKw(settings.solar_power_entity))
+        updateBadge("consumption", readKw(settings.consumption_entity))
+    end
+    return not any_failed
+end
+
+-- Re-checks every tile this dashboard shows and repaints only the ones
+-- whose value actually changed (each poll_fn is the same sync function
+-- its widget's own tap callback uses, which already diffs before
+-- repainting), and refreshes the header clock/badges. Shared by the
+-- periodic poller and by tap callbacks -- so toggling one light, running
+-- a scene, changing the heater, etc. also catches any OTHER entity it
+-- affected (e.g. a scene turning on several lights, not just the button
+-- tapped), not just the one tile that was interacted with.
+function HaDashboard:refreshAllTiles()
+    if self._closed then return end
+    if self.stale_frame and self.stale_frame.time_text then
+        local powerd = Device:getPowerDevice()
+        local battery = powerd and powerd:getCapacity()
+        self.stale_frame.time_text:setText(string.format("%s%s", os.date("%H:%M"), battery and ("  " .. battery .. "%") or ""))
+        partialRefresh(self, self.stale_frame)
+    end
+    -- One combined fetch for every tile this tick instead of one GET per
+    -- tile's own closure (see fetchAllStates/haGetCached above).
+    self._poll_cache = fetchAllStates(self.settings)
+    local any_failed = false
+    for _, fn in ipairs(self.poll_fns) do
+        local ok = fn()
+        if ok == false then any_failed = true end
+    end
+    self:refreshHeaderBadges()
+    self._poll_cache = nil
+    self:setStale(any_failed)
+end
+
+-- Periodic tick (milestone 4, "robustness"). Every Nth tick instead does
+-- a full dashboard rebuild, which forces a real full-screen refresh -- on
+-- e-ink that's what clears the ghosting that accumulates from all the
+-- partial updates in between.
 function HaDashboard:runPoll()
     if self._closed then return end
     self._poll_count = (self._poll_count or 0) + 1
@@ -1147,18 +1350,20 @@ function HaDashboard:runPoll()
         UIManager:show(HaDashboard:new{})
         return
     end
-    local any_failed = false
-    for _, fn in ipairs(self.poll_fns) do
-        local ok = fn()
-        if ok == false then any_failed = true end
-    end
-    self:setStale(any_failed)
+    self:refreshAllTiles()
     self:schedulePoll()
 end
 
 function HaDashboard:onClose()
     self._closed = true
+    if self._poll_task then
+        UIManager:unschedule(self._poll_task)
+    end
     UIManager:close(self)
+    -- Force a full flashing refresh of whatever's now on top, clearing any
+    -- e-ink ghost of the dashboard's last-drawn frame immediately instead
+    -- of leaving it to bleed through until the next natural refresh.
+    UIManager:setDirty(nil, "full")
     return true
 end
 

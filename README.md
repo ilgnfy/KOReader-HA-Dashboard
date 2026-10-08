@@ -5,8 +5,11 @@ Full plan: see `kindle-dashboard-handoff.md` in this folder.
 
 ## Status
 
-Milestone 1 (hello light): one rounded tile, tap toggles a configured light
-via the HA REST API. Not yet tested on real device or emulator.
+Full dashboard (lights, dimmable bulbs, scenes, climate with heater
+selector, weather, power/sensor badges) deployed and running on a real
+Kindle Paperwhite 3, with periodic polling and boot autostart straight
+into the dashboard. See `kindle-dashboard-handoff.md` for the real-device
+setup and incident postmortem.
 
 ## Emulator setup (macOS)
 
