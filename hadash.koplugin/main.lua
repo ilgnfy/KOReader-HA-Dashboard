@@ -1171,6 +1171,14 @@ local HaDashboard = WidgetContainer:extend{
 -- specific trigger.
 local active_dashboard = nil
 
+-- Module-level, not per-instance (poll_count resets to 0 for every
+-- rebuilt instance, so a per-instance check would retrigger forever).
+-- Caps how many early "the initial fetch may have been incomplete,
+-- rebuild and try again" corrections happen per process lifetime -- see
+-- runPoll below.
+local early_rebuild_count = 0
+local MAX_EARLY_REBUILDS = 2
+
 function HaDashboard:init()
     if active_dashboard and not active_dashboard._closed then
         active_dashboard:onClose()
@@ -1275,7 +1283,12 @@ function HaDashboard:init()
                 all_btn.frame.background = Blitbuffer.COLOR_GRAY_5
                 all_btn:refresh()
                 haCallService(settings, "light", "toggle", { entity_id = settings.all_lights_entity })
-                UIManager:scheduleIn(0.4, function() self:refreshAllTiles() end)
+                -- Toggling a light group can take a moment to actually
+                -- propagate to each real bulb, longer than a single
+                -- light's own 0.4s -- refresh twice, catching stragglers
+                -- that hadn't finished applying on the first check.
+                UIManager:scheduleIn(0.8, function() self:refreshAllTiles() end)
+                UIManager:scheduleIn(2.5, function() self:refreshAllTiles() end)
             end,
         }
         if all_on then whiten(all_btn) end
@@ -1297,7 +1310,14 @@ function HaDashboard:init()
                 background = GRAY_FILL,
                 callback = function()
                     haCallService(settings, "scene", "turn_on", { entity_id = scene.entity })
-                    UIManager:scheduleIn(0.4, function() self:refreshAllTiles() end)
+                    -- A scene can change several real bulbs at once, each
+                    -- taking its own moment to actually apply (Zigbee/
+                    -- Wi-Fi propagation, not instant like an HA-internal
+                    -- state change) -- refresh twice, well past both the
+                    -- initial check and typical real-device lag, so a
+                    -- slow light doesn't stay showing its pre-scene value.
+                    UIManager:scheduleIn(0.8, function() self:refreshAllTiles() end)
+                    UIManager:scheduleIn(2.5, function() self:refreshAllTiles() end)
                 end,
             })
         end
@@ -1427,7 +1447,21 @@ end
 function HaDashboard:runPoll()
     if self._closed then return end
     self._poll_count = (self._poll_count or 0) + 1
-    if self._poll_count % FULL_REFRESH_EVERY_N_POLLS == 0 then
+    -- Power badges and scenes (and anything else whose presence depends
+    -- on data available at build time) are structural -- decided once
+    -- when the widget tree is built, not something refreshAllTiles can
+    -- retroactively add. If the very first fetchAllStates (at init) hit
+    -- the device-boot network-not-ready window, those rows are just
+    -- absent until a full rebuild re-evaluates them with fresh data.
+    -- Force that rebuild on the first tick (in addition to the normal
+    -- Nth-tick cadence below) instead of leaving a possibly incomplete
+    -- first render to wait out the full ~10 minutes -- capped at
+    -- MAX_EARLY_REBUILDS total per process lifetime (not per instance:
+    -- poll_count resets to 0 on every rebuild, so without this cap this
+    -- would retrigger every cycle forever and never settle).
+    local want_early_rebuild = self._poll_count == 1 and early_rebuild_count < MAX_EARLY_REBUILDS
+    if want_early_rebuild or self._poll_count % FULL_REFRESH_EVERY_N_POLLS == 0 then
+        if want_early_rebuild then early_rebuild_count = early_rebuild_count + 1 end
         self._closed = true
         UIManager:close(self)
         UIManager:show(HaDashboard:new{})
