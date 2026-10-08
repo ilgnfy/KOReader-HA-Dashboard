@@ -1,9 +1,6 @@
-# Kindle PW3 Home Assistant dashboard: handoff
+# Technical notes: real-device setup, upstart internals, incident history
 
-Project: touch dashboard for Home Assistant (lights, heating, room values) on a Kindle Paperwhite 3 (7th gen, 1072 x 1448 px, 300 ppi), implemented as a KOReader plugin (`hadash.koplugin`, Lua).
-Full plan (setup steps, HA config, risks): https://claude.ai/code/artifact/086c207d-b376-49a8-8b1e-359fa113a444
-
-User preferences: metric units, concise and factual language, iterative collaboration (small steps, feedback over big rewrites).
+This is the detailed technical companion to the main [README](README.md) — exact upstart job contents, the reasoning behind each native-service disable, and a full incident postmortem from development (what broke, how it was diagnosed, how it was fixed). Read this before editing anything under `/etc/upstart` on your own device; several of the mistakes documented here came from skipping exactly that.
 
 ## Decisions made
 
@@ -175,14 +172,3 @@ Verified working end-to-end, survives reboot.
   granting the token's user admin rights, a real security trade-off,
   deliberately not made).
 
-## Open inputs needed from the user
-
-- Kindle firmware version and which jailbreak the wizard names.
-- One light entity ID and one climate entity ID from Home Assistant.
-- Whether the KOReader release page offers a macOS build.
-
-## Suggested first tasks for Claude Code
-
-1. Create `hadash.koplugin/_meta.lua` and `main.lua` for milestone 1 (one light tile), reading URL, token and entity from a separate settings file.
-2. Add a `deploy.sh` (tar over SSH, then restart) and a README with emulator instructions.
-3. Run in the emulator against the real Home Assistant and fix issues before touching the Kindle.
