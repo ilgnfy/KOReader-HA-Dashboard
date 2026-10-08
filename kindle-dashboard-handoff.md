@@ -92,6 +92,33 @@ this specific unit, not something our setup causes. Crash dump files
 `/mnt/us/documents/` if they clutter the library; they're not needed once
 triaged.
 
+## Troubleshooting: recovering a half-bricked Kindle (blank screen / boot loop)
+
+A second, separate incident, later in development: repeatedly `kill -9`ing live native processes on a tight cycle (the original `cvm`/`KPPMainApp`-killing approach, before it was replaced with disabling those jobs so they never start at all — see above) read to the device's own firmware-level watchdog as instability, and it started force-rebooting on its own. End result: blank screen, or a boot loop that never got further than Amazon's bare fallback/setup screen. If you hit something like this, here's the path that actually worked, cheapest option first.
+
+### Step 1: confirm the system isn't actually destroyed, via UART
+
+Before assuming the worst, get a serial console on the boot process — this tells you whether the underlying Linux system and your data are intact, or genuinely corrupted, before you commit to anything destructive.
+
+- **Hardware**: the PW3's UART pins run at **1.8V logic internally**. Most cheap USB-serial adapters are 3.3V or 5V. The safe way to bridge the two is a 3.3V UART-to-USB adapter with a resistor voltage divider on its TX line into the Kindle's RX pin, so you never drive the 1.8V-rated input above its tolerance. (In practice, a bare 3.3V adapter connected directly — no divider — was used successfully during development without visible damage, but that's a real gamble with the hardware, not something to copy. Do the divider.)
+- **Pinout**: GND/RX/TX exposed as small test pads, usually near a board edge; the smallest pad is typically GND. 115200 8N1.
+- Connect (macOS example): `screen /dev/tty.usbserial-XXXX 115200`. Power on, watch the boot log, and interrupt autoboot (any key during the countdown) to drop into the u-boot/diagnostic console.
+- From that console, if a self-test command is available (this device had `diag run mmc_crc32`), run it. It CRC-checks each eMMC partition individually. If `.kernel`/`.system`/`.userdata` (and similar) **pass** but only low-level partitions like `.bootloader`/`.bist`/`.diags` **fail**, your actual OS and data are intact — only the recovery/bootloader side is damaged, which isn't needed for normal booting. That's a very different (much better) situation than genuine corruption, and means you very likely don't need a deep flash-level repair at all.
+
+### Step 2: the easy fix (worked here)
+
+With the real system confirmed intact, the fix was almost anticlimactic:
+
+1. Download the **official** Amazon firmware file for this exact model and the version already installed (`update_kindle_<version>.bin` — don't substitute a different version).
+2. Connect the Kindle over USB, drag that file onto the root of its drive, eject.
+3. Restart normally.
+
+Amazon's own updater detects it and reapplies the firmware on boot — even reinstalling the *same* version works, since it's a full image reinstall, not a diff, and it repairs whatever got corrupted. This alone resolved the boot loop without needing any UART-level flashing.
+
+### Step 3 (last resort): hard factory reset
+
+If the update-file trick doesn't resolve it: create an **empty** file named exactly `DO_FACTORY_RESTORE` (no extension) at the root of the Kindle's USB-mounted drive, eject, restart. This triggers Amazon's own factory-restore flow on next boot. It's more destructive (wipes more local state than a normal update) but it's a reliable last-resort recovery path — used more than once during development to get back from a worse state than described here.
+
 ## Real-device setup (Kindle PW3, WinterBreak 2)
 
 Verified working end-to-end, survives reboot.
