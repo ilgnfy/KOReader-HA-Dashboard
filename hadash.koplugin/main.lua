@@ -1500,10 +1500,25 @@ local HaDash = WidgetContainer:extend{
 -- process (the module is only require()'d once), so it only fires once
 -- per real boot/launch.
 local has_auto_opened = false
+local has_set_keepalive = false
 
 function HaDash:init()
     self.ui.menu:registerToMainMenu(self)
     local settings = loadSettings()
+    -- KOReader's own auto_suspend/auto_standby settings (both disabled in
+    -- settings.reader.lua) only control how KOReader *reacts* to a
+    -- suspend -- they don't stop the underlying powerd OS layer from
+    -- deciding to suspend on its own independent inactivity timer, which
+    -- is what was still happening (screen holds its last e-ink image
+    -- through a real hardware suspend, touch dead until a power-button
+    -- wake). This is the actual property that prevents that, same one
+    -- KOReader's own stock keepalive.koplugin uses on Kindle. The
+    -- dashboard should never sleep at all -- that's the whole point of
+    -- the appliance -- so set it unconditionally, once per process.
+    if not has_set_keepalive then
+        has_set_keepalive = true
+        os.execute("lipc-set-prop com.lab126.powerd preventScreenSaver 1")
+    end
     -- Jump straight to the dashboard on first launch instead of needing
     -- Tools > HA Dashboard. Set auto_open = true in hadash_settings.lua.
     if settings and settings.auto_open and not has_auto_opened then
