@@ -5,12 +5,16 @@ local DataStorage = require("datastorage")
 local Device = require("device")
 local Font = require("ui/font")
 local FrameContainer = require("ui/widget/container/framecontainer")
+local Geom = require("ui/geometry")
+local GestureRange = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local IconWidget = require("ui/widget/iconwidget")
+local InputContainer = require("ui/widget/container/inputcontainer")
 local JSON = require("json")
 local LeftContainer = require("ui/widget/container/leftcontainer")
 local OverlapGroup = require("ui/widget/overlapgroup")
+local ProgressWidget = require("ui/widget/progresswidget")
 local RightContainer = require("ui/widget/container/rightcontainer")
 local Screen = Device.screen
 local Size = require("ui/size")
@@ -236,6 +240,72 @@ end
 -- Small widget builders
 ----------------------------------------------------------------
 
+-- Touch-drag brightness slider. KOReader has no ready-made Slider class --
+-- this mirrors how the real frontlight-brightness control is built
+-- (ui/widget/frontlightwidget.lua): a plain ProgressWidget (paints the
+-- bar, has no gesture handling of its own) wrapped in a small
+-- InputContainer that owns the actual touch handling. `range = self.dimen`
+-- (not a fresh Geom copy) is deliberate -- GestureRange needs the SAME
+-- table the paint system fills in with the widget's real x/y once
+-- positioned, not a frozen snapshot taken at construction time before
+-- that's known (an earlier bug in this file, now fixed everywhere else
+-- by using Button, which does exactly this internally -- see button.lua).
+-- Both tap and pan land on the same handler: KOReader's own frontlight
+-- slider doesn't distinguish "dragging" from "released" either, since a
+-- pan delivers a touch position on every tick regardless.
+local DragSlider = InputContainer:extend{
+    width = nil,
+    height = nil,
+    percentage = 0,
+    on_change = nil, -- function(perc) end, called on every tap/drag tick
+}
+
+function DragSlider:init()
+    self.progress = ProgressWidget:new{
+        width = self.width,
+        height = self.height,
+        percentage = self.percentage,
+        -- Match the dashboard's rounded/flat style, but gently --
+        -- ProgressWidget rounds its border/background via
+        -- paintRoundedRect/paintBorder, but always paints the actual
+        -- fill bar as a plain rectangle (progresswidget.lua) regardless
+        -- of radius. At a full pill radius (height/2) that mismatch is
+        -- very visible (a sharp-cornered fill poking into a big rounded
+        -- arc); a small radius keeps it rounded without the seam being
+        -- obvious. This is a KOReader core-widget limitation, not
+        -- something fixable from the plugin side.
+        radius = Screen:scaleBySize(6),
+        bordersize = Size.border.window,
+        bordercolor = Blitbuffer.COLOR_BLACK,
+        bgcolor = Blitbuffer.COLOR_WHITE,
+        fillcolor = Blitbuffer.COLOR_BLACK,
+    }
+    self[1] = self.progress
+    -- getSize() on ProgressWidget returns a bare {w,h} table, not a real
+    -- Geom instance -- GestureRange:match() calls :contains() on this,
+    -- which a bare table doesn't have. Wrap explicitly; x/y start at 0
+    -- here but this is the same table instance that gets positioned
+    -- (x/y filled in in place) once the layout system places the
+    -- widget, same as self.dimen = self.frame:getSize() in button.lua.
+    local size = self.progress:getSize()
+    self.dimen = Geom:new{ x = 0, y = 0, w = size.w, h = size.h }
+    if Device:isTouchDevice() then
+        self.ges_events = {
+            SliderDrag = { GestureRange:new{ ges = "pan", range = self.dimen } },
+            SliderTap = { GestureRange:new{ ges = "tap", range = self.dimen } },
+        }
+    end
+end
+
+function DragSlider:onSliderDrag(_, ges_ev)
+    local perc = self.progress:getPercentageFromPosition(ges_ev.pos)
+    if not perc then return true end
+    self.progress:setPercentage(perc)
+    if self.on_change then self.on_change(perc) end
+    return true
+end
+DragSlider.onSliderTap = DragSlider.onSliderDrag
+
 -- Button text is always black unless we invert it for a black-filled button.
 local function whiten(btn)
     if btn.label_widget then
@@ -370,11 +440,22 @@ local function buildDimmableCard(settings, light, state, width, dashboard_self)
     local is_on = state and state.state == "on"
     local pct = brightnessPct(state and state.attributes)
     local label = light.label or light.entity
-    local card, toggle_btn, pct_text -- forward-declared, wired up below
+    local card, toggle_btn, slider -- forward-declared, wired up below
     local last_is_on, last_pct = is_on, pct
 
-    -- Shared by the +/-/toggle callbacks and the periodic poller. Returns
+    -- Percentage lives in the toggle button's own label ("Bedroom · ON -
+    -- 89%") rather than a separate text row, to save vertical space.
+    local function toggleLabel(is_on_, pct_)
+        return label .. (is_on_ and " · ON" or " · OFF") .. (pct_ and (" - " .. pct_ .. "%") or "")
+    end
+
+    -- Shared by the toggle callback and the periodic poller. Returns
     -- false on fetch failure; skips the repaint when nothing changed.
+    -- (The slider's own drag handler updates the label/slider itself
+    -- immediately and sets last_pct right away -- see onSliderChange
+    -- below -- so this only visibly does anything here when HA's
+    -- confirmed value disagrees with what was optimistically shown, or
+    -- when the change came from elsewhere, e.g. the HA app.)
     local function refreshFromServer()
         local new_state = haGetCached(dashboard_self, settings, light.entity)
         if not new_state then return false end
@@ -382,15 +463,19 @@ local function buildDimmableCard(settings, light, state, width, dashboard_self)
         local new_pct = brightnessPct(new_state.attributes)
         if new_is_on == last_is_on and new_pct == last_pct then return true end
         last_is_on, last_pct = new_is_on, new_pct
-        setToggleVisual(toggle_btn, new_is_on, label, Blitbuffer.COLOR_WHITE)
-        pct_text:setText(new_pct and (new_pct .. "%") or "—")
+        toggle_btn:setText(toggleLabel(new_is_on, new_pct), toggle_btn.width)
+        toggle_btn.frame.background = new_is_on and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE
+        toggle_btn.label_widget.fgcolor = new_is_on and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK
+        if slider and new_pct then
+            slider.progress:setPercentage(new_pct / 100)
+        end
         partialRefresh(dashboard_self, card)
         return true
     end
     table.insert(dashboard_self.poll_fns, refreshFromServer)
 
     toggle_btn = Button:new{
-        text = label .. (is_on and " · ON" or " · OFF"),
+        text = toggleLabel(is_on, pct),
         width = width - Size.padding.large * 2,
         height = Screen:scaleBySize(56),
         background = is_on and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
@@ -411,56 +496,36 @@ local function buildDimmableCard(settings, light, state, width, dashboard_self)
     }
     if is_on then whiten(toggle_btn) end
 
-    local function step(delta)
-        return function()
+    -- Debounced HA call: fires ~0.3s after the finger pauses/lifts, not on
+    -- every touch-move tick -- a fast drag would otherwise spam HA with a
+    -- service call per pixel of movement. The slider position and label
+    -- update immediately regardless (see DragSlider:onSliderDrag above),
+    -- so dragging itself never waits on the network either way.
+    local send_task
+    local function onSliderChange(perc)
+        local new_pct = round(perc * 100)
+        last_pct = new_pct
+        toggle_btn:setText(toggleLabel(last_is_on, new_pct), toggle_btn.width)
+        partialRefresh(dashboard_self, card)
+        if send_task then UIManager:unschedule(send_task) end
+        send_task = function()
             haCallService(settings, "light", "turn_on", {
                 entity_id = light.entity,
-                brightness_step_pct = delta,
+                brightness_pct = new_pct,
             })
             UIManager:scheduleIn(0.4, function()
                 refreshFromServer()
                 dashboard_self:refreshHeaderBadges()
             end)
         end
+        UIManager:scheduleIn(0.3, send_task)
     end
 
-    local minus_btn = Button:new{
-        text = "−",
-        width = Screen:scaleBySize(52),
-        height = Screen:scaleBySize(52),
-        background = Blitbuffer.COLOR_WHITE,
-        bordersize = Size.border.window,
-        radius = RADIUS_ROUND,
-        text_font_size = 26,
-        text_font_bold = true,
-        callback = step(-10),
-    }
-    local plus_btn = whiten(Button:new{
-        text = "+",
-        width = Screen:scaleBySize(52),
-        height = Screen:scaleBySize(52),
-        background = Blitbuffer.COLOR_BLACK,
-        bordersize = Size.border.window,
-        radius = RADIUS_ROUND,
-        text_font_size = 26,
-        text_font_bold = true,
-        callback = step(10),
-    })
-    pct_text = TextWidget:new{
-        text = pct and (pct .. "%") or "—",
-        face = Font:getFace("cfont", 22),
-        fgcolor = Blitbuffer.COLOR_BLACK,
-    }
-
-    local brightness_row = HorizontalGroup:new{
-        minus_btn,
-        HorizontalSpan:new{ width = Size.span.horizontal_default },
-        CenterContainer:new{
-            dimen = { w = width - Size.padding.large * 2 - minus_btn:getSize().w * 2 - Size.span.horizontal_default * 2, h = pct_text:getSize().h },
-            pct_text,
-        },
-        HorizontalSpan:new{ width = Size.span.horizontal_default },
-        plus_btn,
+    slider = DragSlider:new{
+        width = width - Size.padding.large * 2,
+        height = Screen:scaleBySize(36),
+        percentage = (pct or 0) / 100,
+        on_change = onSliderChange,
     }
 
     card = FrameContainer:new{
@@ -477,7 +542,7 @@ local function buildDimmableCard(settings, light, state, width, dashboard_self)
         VerticalGroup:new{
             toggle_btn,
             VerticalSpan:new{ width = Size.span.vertical_large },
-            brightness_row,
+            slider,
         },
     }
     return card
@@ -509,8 +574,17 @@ end
 local function buildClimateCard(settings, heater_states, width, dashboard_self)
     local heaters = settings.climate_entities or {}
     local selected = 1
-    local card, current_text, target_text, heat_btn
+    local card, current_text, humidity_text, target_text, heat_btn
     local selector_btns = {}
+
+    -- Ambient humidity, shown next to the current temperature (same
+    -- source that used to be the header's own temp/humidity chip, now
+    -- removed -- the temperature half of that is already this card's own
+    -- current_text via the heater's current_temperature attribute).
+    local humidity_sensor
+    for _, s in ipairs(settings.sensors or {}) do
+        if s.unit == "%" then humidity_sensor = s break end
+    end
 
     local function currentHeater() return heaters[selected] end
 
@@ -530,6 +604,10 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
                 tostring(s.attributes and s.attributes.temperature)
             ) or "nil")
         end
+        if humidity_sensor then
+            local hs = heater_states[humidity_sensor.entity]
+            table.insert(parts, hs and tostring(hs.state) or "nil")
+        end
         return table.concat(parts, ";")
     end
     local last_signature = computeSignature()
@@ -544,6 +622,12 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
 
         current_text:setText(current and (current .. "°") or "—")
         target_text:setText(target and (_("Target: ") .. target .. "°") or _("Target: —"))
+
+        if humidity_text and humidity_sensor then
+            local hs = heater_states[humidity_sensor.entity]
+            local hval = hs and tonumber(hs.state)
+            humidity_text:setText(hval and (round(hval) .. "%") or "—")
+        end
 
         heat_btn:setText(is_heat and _("Heat") or _("Off"), heat_btn.width)
         heat_btn.frame.background = is_heat and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE
@@ -565,6 +649,9 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
             local new_state = haGetCached(dashboard_self, settings, h.entity)
             if not new_state then return false end
             heater_states[h.entity] = new_state
+        end
+        if humidity_sensor then
+            heater_states[humidity_sensor.entity] = haGetCached(dashboard_self, settings, humidity_sensor.entity)
         end
         for i, h in ipairs(heaters) do
             local s = heater_states[h.entity]
@@ -633,6 +720,16 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
         bold = true,
         fgcolor = Blitbuffer.COLOR_BLACK,
     }
+    if humidity_sensor then
+        local initial_hs = heater_states[humidity_sensor.entity]
+        local initial_hval = initial_hs and tonumber(initial_hs.state)
+        humidity_text = TextWidget:new{
+            text = initial_hval and (round(initial_hval) .. "%") or "—",
+            face = Font:getFace("cfont", 54),
+            bold = true,
+            fgcolor = Blitbuffer.COLOR_BLACK,
+        }
+    end
     target_text = TextWidget:new{
         text = initial_target and (_("Target: ") .. initial_target .. "°") or _("Target: —"),
         face = Font:getFace("cfont", 20),
@@ -694,8 +791,19 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
     )
     local small_vgap = Size.span.vertical_default
 
+    -- Humidity (same ambient sensor the header's own temp/humidity chip
+    -- used to show, now removed) fills the whitespace beside the big
+    -- current-temperature number, same size, rather than its own row.
+    local temp_row = current_text
+    if humidity_text then
+        temp_row = HorizontalGroup:new{
+            current_text,
+            HorizontalSpan:new{ width = Screen:scaleBySize(40) },
+            humidity_text,
+        }
+    end
     local temp_target_stack = VerticalGroup:new{
-        current_text,
+        temp_row,
         VerticalSpan:new{ width = small_vgap },
         target_text,
     }
@@ -797,14 +905,27 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
     }
 
     -- Presets pinned to the left edge, spanning the full row height;
-    -- current temp + target centered in the full column width,
-    -- independent of the presets' width (a plain HorizontalGroup would
-    -- instead center the two of them as one glued block, pulling the
-    -- presets off the left edge).
+    -- current temp + target centered in the space to the right of the
+    -- presets column (not the full column width -- adding the humidity
+    -- reading next to the current temperature widened this block enough
+    -- that centering it across the *full* width made it overlap the
+    -- presets; indenting the centering region past the presets' own
+    -- width keeps them apart). A plain HorizontalGroup of the two would
+    -- instead center them as one glued block, pulling the presets off
+    -- the left edge, hence still using OverlapGroup for the presets.
+    local presets_w = presets_col:getSize().w
+    local temp_indent = presets_w + Screen:scaleBySize(12)
+    local temp_area_w = left_col_w - temp_indent
     local row2 = OverlapGroup:new{
         dimen = { w = left_col_w, h = row2_h },
         LeftContainer:new{ dimen = { w = left_col_w, h = row2_h }, presets_col },
-        CenterContainer:new{ dimen = { w = left_col_w, h = row2_h }, temp_target_stack },
+        LeftContainer:new{
+            dimen = { w = left_col_w, h = row2_h },
+            HorizontalGroup:new{
+                HorizontalSpan:new{ width = temp_indent },
+                CenterContainer:new{ dimen = { w = temp_area_w, h = row2_h }, temp_target_stack },
+            },
+        },
     }
 
     local left_col = VerticalGroup:new{
@@ -848,10 +969,14 @@ local function buildWeatherChip(width, state, forecast)
         if hi and lo then
             table.insert(detail_parts, string.format("H:%s°  L:%s°", hi, lo))
         end
-        -- This integration doesn't expose a rain-chance percentage, only a
-        -- forecast precipitation amount (mm) for the day.
+        -- Prefer HA's standard rain-chance percentage field when the
+        -- weather integration provides it; fall back to a precipitation
+        -- amount (mm) for integrations that don't.
+        local rain_chance = forecast.precipitation_probability
         local rain_mm = forecast.precipitation
-        if type(rain_mm) == "number" then
+        if type(rain_chance) == "number" then
+            table.insert(detail_parts, string.format(_("Rain: %d%%"), round(rain_chance)))
+        elseif type(rain_mm) == "number" then
             table.insert(detail_parts, rain_mm > 0
                 and string.format(_("Rain: %.1fmm"), rain_mm)
                 or _("No rain"))
@@ -894,62 +1019,20 @@ local function buildWeatherChip(width, state, forecast)
     }
 end
 
--- "21° · 45%" readout from the configured sensors, in a small boxed chip
--- with a house icon, shown next to the greeting in the header.
-local function buildHeaderSensorBox(settings, states)
-    if not settings.sensors or #settings.sensors == 0 then return nil end
-    local parts = {}
-    for _, sensor in ipairs(settings.sensors) do
-        local state = states[sensor.entity]
-        local value = state and state.state
-        if value and value ~= "unavailable" and value ~= "unknown" then
-            local num = tonumber(value)
-            table.insert(parts, string.format("%s%s", num and round(num) or value, sensor.unit or ""))
-        end
-    end
-    if #parts == 0 then return nil end
+-- Formerly "21° · 45%" header chip -- removed; the temperature half is
+-- already shown big in the climate card (heater's own current_temperature
+-- attribute) and the humidity half now sits next to it there instead
+-- (see buildClimateCard/humidity_sensor), filling whitespace that used to
+-- go unused next to the big number.
 
-    local icon_size = Screen:scaleBySize(26)
-    local text_widget = TextWidget:new{
-        text = table.concat(parts, " · "),
-        face = Font:getFace("cfont", 20),
-        fgcolor = Blitbuffer.COLOR_BLACK,
-    }
-    local box = FrameContainer:new{
-        background = GRAY_FILL,
-        bordersize = Size.border.window,
-        radius = RADIUS_PILL,
-        -- padding_h/padding_v aren't real FrameContainer fields.
-        padding_top = Size.padding.small,
-        padding_bottom = Size.padding.small,
-        padding_left = Size.padding.default,
-        padding_right = Size.padding.default,
-        HorizontalGroup:new{
-            -- alpha=true: without it, icons get pre-flattened against a
-            -- hard-coded white backing (fine on white, but leaves a visible
-            -- white box here since this chip's background is gray).
-            IconWidget:new{ icon = "home", width = icon_size, height = icon_size, alpha = true },
-            HorizontalSpan:new{ width = Size.span.horizontal_small },
-            text_widget,
-        },
-    }
-    box.text_widget = text_widget
-    return box
-end
-
-local function buildHeader(width, greeting, sensor_box, exit_callback)
+local function buildHeader(width, power_badges, exit_callback)
     local height = Screen:scaleBySize(70)
-    local left_items = {
-        TextWidget:new{
-            text = greeting,
-            face = Font:getFace("cfont", 26),
-            bold = true,
-            fgcolor = Blitbuffer.COLOR_BLACK,
-        },
-    }
-    if sensor_box then
-        table.insert(left_items, HorizontalSpan:new{ width = Size.span.horizontal_default })
-        table.insert(left_items, sensor_box)
+    -- Power badges (battery/solar/consumption) sit left-aligned in the
+    -- header itself now, in place of a greeting -- saves the separate
+    -- row they used to need below the header.
+    local left_items = {}
+    if power_badges then
+        table.insert(left_items, power_badges)
     end
     local powerd = Device:getPowerDevice()
     local battery = powerd and powerd:getCapacity()
@@ -1065,14 +1148,6 @@ local function buildPowerBadges(settings, states)
     return group
 end
 
-local function greetingForHour()
-    local h = tonumber(os.date("%H"))
-    if h < 6 then return _("Good night")
-    elseif h < 12 then return _("Good morning")
-    elseif h < 18 then return _("Good afternoon")
-    else return _("Good evening") end
-end
-
 ----------------------------------------------------------------
 -- Full-screen dashboard
 ----------------------------------------------------------------
@@ -1081,7 +1156,27 @@ local HaDashboard = WidgetContainer:extend{
     name = "hadash_dashboard",
 }
 
+-- Module-level, not per-instance -- same reasoning as has_auto_opened
+-- below. Hard guarantee against two live instances ever polling at once:
+-- confirmed on-device via crash.log timestamps showing a clean single
+-- "template fetch failed" every 60s *plus* a separate cluster of ~3 near-
+-- simultaneous ones every 60s, i.e. more than one instance's poll loop
+-- running concurrently -- each doing its own full entity fetch and
+-- stacking CPU/network work on KOReader's single Lua thread, which lines
+-- up with the "unresponsive after a while, needs a power-button press"
+-- freeze. Whatever the exact path that creates a second instance (close
+-- not going through onClose, a race during the periodic full-refresh
+-- rebuild, etc), forcing any previous instance closed before a new one
+-- is ever shown rules it out categorically rather than chasing the
+-- specific trigger.
+local active_dashboard = nil
+
 function HaDashboard:init()
+    if active_dashboard and not active_dashboard._closed then
+        active_dashboard:onClose()
+    end
+    active_dashboard = self
+
     self.dimen = Screen:getSize()
     local settings = loadSettings()
     if not settings then
@@ -1102,25 +1197,15 @@ function HaDashboard:init()
     local states = fetchAllStates(settings)
     local forecast = fetchForecast(settings)
     local content_w = self.dimen.w - GUTTER * 2
-    local sensor_box = buildHeaderSensorBox(settings, states)
-    self.sensor_box = sensor_box
-    local header, stale_frame = buildHeader(content_w, greetingForHour(), sensor_box, function()
+    local power_badges = buildPowerBadges(settings, states)
+    self.power_badges = power_badges
+    local header, stale_frame = buildHeader(content_w, power_badges, function()
         UIManager:close(self)
     end)
     self.stale_frame = stale_frame
     local rows = {
         header,
     }
-    local power_badges = buildPowerBadges(settings, states)
-    self.power_badges = power_badges
-    if power_badges then
-        local badges_h = power_badges:getSize().h
-        table.insert(rows, VerticalSpan:new{ width = Screen:scaleBySize(10) })
-        table.insert(rows, LeftContainer:new{
-            dimen = { w = content_w, h = badges_h },
-            power_badges,
-        })
-    end
 
     table.insert(rows, VerticalSpan:new{ width = GUTTER })
     table.insert(rows, buildWeatherChip(content_w, states[settings.weather_entity], forecast))
@@ -1278,27 +1363,6 @@ function HaDashboard:refreshHeaderBadges()
     if self._closed then return end
     local settings = self.settings
     local any_failed = false
-    if self.sensor_box and settings.sensors then
-        local parts = {}
-        for _, sensor in ipairs(settings.sensors) do
-            local state = haGetCached(self, settings, sensor.entity)
-            if not state then
-                any_failed = true
-            else
-                local value = state.state
-                if value and value ~= "unavailable" and value ~= "unknown" then
-                    local num = tonumber(value)
-                    table.insert(parts, string.format("%s%s", num and round(num) or value, sensor.unit or ""))
-                end
-            end
-        end
-        local new_text = table.concat(parts, " · ")
-        if new_text ~= self._last_sensor_text then
-            self._last_sensor_text = new_text
-            self.sensor_box.text_widget:setText(new_text)
-            partialRefresh(self, self.sensor_box)
-        end
-    end
     if self.power_badges and self.power_badges.text_widgets then
         local function readKw(entity_id)
             local state = entity_id and haGetCached(self, settings, entity_id)
