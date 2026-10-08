@@ -62,7 +62,7 @@ local RADIUS_ROUND = Screen:scaleBySize(36) -- +/- circular buttons
 -- between a full-screen refresh to clear any e-ink ghosting that's
 -- accumulated from all the partial updates in between.
 local POLL_INTERVAL_S = 60
-local FULL_REFRESH_EVERY_N_POLLS = 10 -- ~10 minutes at the default interval
+local FULL_REFRESH_EVERY_N_POLLS = 30 -- ~30 minutes at the default 60s interval
 
 ----------------------------------------------------------------
 -- HA REST helpers
@@ -193,7 +193,7 @@ local function fetchAllStates(settings)
 {%% for eid in [%s] %%}
 {%% set st = states[eid] %%}
 {%% if st %%}
-{%% set ns.result = ns.result | combine({eid: {'state': st.state, 'attributes': st.attributes | dict}}) %%}
+{%% set ns.result = ns.result | combine({(eid): {'state': st.state, 'attributes': st.attributes}}) %%}
 {%% endif %%}
 {%% endfor %%}
 {{ ns.result | tojson }}
@@ -216,7 +216,7 @@ local function fetchAllStates(settings)
         local decode_ok, decoded = pcall(JSON.decode, table.concat(resp_body))
         if decode_ok and type(decoded) == "table" then return decoded end
     end
-    logger.warn("hadash: template fetch failed, falling back to per-entity GET", ok, code)
+    logger.warn("hadash: template fetch failed, falling back to per-entity GET", ok, code, table.concat(resp_body):sub(1, 300))
 
     local states = {}
     for _, entity_id in ipairs(entity_ids) do

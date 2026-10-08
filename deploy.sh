@@ -21,6 +21,12 @@ echo "Deploying $PLUGIN_DIR to root@$KINDLE_HOST:$SSH_PORT:$KOREADER_DIR/plugins
 tar -cf - "$PLUGIN_DIR" | ssh -p "$SSH_PORT" "root@$KINDLE_HOST" "mkdir -p '$KOREADER_DIR/plugins' && tar -xf - -C '$KOREADER_DIR/plugins'"
 
 echo "Restarting KOReader"
-ssh -p "$SSH_PORT" "root@$KINDLE_HOST" "killall -q koreader || true"
+# The actual interpreter process is named "luajit" (running ./reader.lua
+# as its argument) -- "koreader" matches nothing, so this used to be a
+# silent no-op (killall -q + || true swallowed the failure), leaving the
+# running process on stale code until a real device reboot happened to
+# follow. Confirmed on-device: a process could sit unchanged for 30+
+# minutes across several "successful" deploys before this fix.
+ssh -p "$SSH_PORT" "root@$KINDLE_HOST" "killall -q luajit || true"
 
 echo "Done. KOReader should relaunch and reload the plugin."
