@@ -10,6 +10,7 @@ local GestureRange = require("ui/gesturerange")
 local HorizontalGroup = require("ui/widget/horizontalgroup")
 local HorizontalSpan = require("ui/widget/horizontalspan")
 local IconWidget = require("ui/widget/iconwidget")
+local InfoMessage = require("ui/widget/infomessage")
 local InputContainer = require("ui/widget/container/inputcontainer")
 local JSON = require("json")
 local LeftContainer = require("ui/widget/container/leftcontainer")
@@ -345,6 +346,7 @@ local function fetchAllStates(settings)
     if settings.battery_entity then table.insert(entity_ids, settings.battery_entity) end
     if settings.solar_power_entity then table.insert(entity_ids, settings.solar_power_entity) end
     if settings.consumption_entity then table.insert(entity_ids, settings.consumption_entity) end
+    if settings.frontlight_entity then table.insert(entity_ids, settings.frontlight_entity) end
     if #entity_ids == 0 then return {} end
 
     local quoted_ids = {}
@@ -1585,12 +1587,24 @@ function HaDashboard:enterPowerSaving()
         self._ps_frontlight_was_on = true
         powerd:turnOffFrontlight()
     end
+    -- InfoMessage already vanishes on its own on any key/tap press; our
+    -- own onInputEvent hook (fires globally, regardless of what's on
+    -- top) explicitly closes it too below, so either path dismisses it.
+    self._ps_overlay = InfoMessage:new{
+        text = _("Power Saving mode\nTap anywhere to wake"),
+        dismissable = true,
+    }
+    UIManager:show(self._ps_overlay)
 end
 
 function HaDashboard:wakeFromPowerSaving()
     if not ps_sleeping then return end
     ps_sleeping = false
     last_activity = os.time()
+    if self._ps_overlay then
+        UIManager:close(self._ps_overlay)
+        self._ps_overlay = nil
+    end
     setWifiEnabled(true)
     if self._ps_frontlight_was_on then
         local powerd = Device:getPowerDevice()
@@ -1698,6 +1712,25 @@ function HaDashboard:refreshAllTiles()
     -- One combined fetch for every tile this tick instead of one GET per
     -- tile's own closure (see fetchAllStates/haGetCached above).
     self._poll_cache = fetchAllStates(self.settings)
+    -- Optional: let an HA entity (e.g. a lux-sensor-driven automation)
+    -- decide whether the frontlight should be on, instead of KOReader's
+    -- own generic idle timer (autodim_starttime_minutes, disabled in
+    -- settings.reader.lua for this to take over cleanly). Skipped while
+    -- Power Saving is asleep -- that mode's own frontlight-off takes
+    -- priority and this would otherwise immediately fight it back on.
+    if self.settings.frontlight_entity and not ps_sleeping then
+        local fl_state = haGetCached(self, self.settings, self.settings.frontlight_entity)
+        local powerd2 = Device:getPowerDevice()
+        if fl_state and powerd2 then
+            local want_on = fl_state.state == "on"
+            local is_on = powerd2:isFrontlightOn()
+            if want_on and not is_on then
+                powerd2:turnOnFrontlight()
+            elseif not want_on and is_on then
+                powerd2:turnOffFrontlight()
+            end
+        end
+    end
     local any_failed = false
     for _, fn in ipairs(self.poll_fns) do
         local ok = fn()

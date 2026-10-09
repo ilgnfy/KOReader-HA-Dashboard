@@ -77,4 +77,14 @@ return {
     mqtt_port = 1883,
     mqtt_user = nil,
     mqtt_password = nil,
+
+    -- Optional: let an HA entity decide whether the frontlight is on
+    -- (e.g. a lux-sensor-driven automation, exposed as a light/switch/
+    -- input_boolean whose state is "on"/"off"), instead of KOReader's
+    -- own generic idle-dimmer. If you set this, also disable KOReader's
+    -- own autodim (Settings -> Screen -> dim after inactivity, or set
+    -- autodim_starttime_minutes to -1 in settings.reader.lua) so the two
+    -- don't fight each other. Ignored while Power Saving mode is asleep
+    -- -- that mode's own frontlight-off always takes priority.
+    frontlight_entity = nil, -- e.g. "input_boolean.kindle_frontlight"
 }
