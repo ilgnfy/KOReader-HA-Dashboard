@@ -182,6 +182,20 @@ local fl_wake_brightness = 12 -- native Kindle scale is 0-24, not 0-100
 -- would get reset back to the config-file value every ~30 min).
 local ps_timeout_s = 300
 local ps_timeout_seeded = false
+-- Timestamp of the last fully-successful refreshAllTiles (no failed
+-- entity fetch) -- exposed to HA so a stuck/stale dashboard is visible
+-- remotely instead of only noticeable by looking at the device itself.
+local last_poll_ok_time = nil
+-- Set by the MQTT message handler (module-level, no self -- see
+-- scheduleMqttTick for why this needs a flag instead of calling
+-- self:refreshAllTiles() directly) when the "Force Refresh" button is
+-- pressed from HA; consumed on the next 3s MQTT tick.
+local force_refresh_requested = false
+-- HA-adjustable via MQTT (number entity) -- how often the fast ticker
+-- (MQTT command read, PS icon sync, wifi/frontlight diagnostics) runs
+-- while awake. Lower = snappier remote commands, more CPU wake-ups;
+-- higher = less overhead, slower to react to an HA-side toggle.
+local mqtt_tick_interval_s = 3
 
 local MQTT_DEVICE = {
     identifiers = { "kindle_dashboard" },
@@ -198,6 +212,20 @@ local MQTT_DEVICE = {
 -- process stay fully live throughout, so any tap wakes instantly.
 local function setWifiEnabled(enabled)
     os.execute("lipc-set-prop com.lab126.cmd wirelessEnable " .. (enabled and "1" or "0"))
+end
+
+-- The ath6kl driver on this Kindle doesn't implement the standard
+-- Wireless Extensions ioctls KOReader's own ffi/netinfo.lua relies on
+-- (confirmed: /proc/net/wireless has no data row, iwconfig says "no
+-- wireless extensions") -- wpa_supplicant's own control socket is the
+-- one thing that actually reports RSSI here.
+local function getWifiRssi()
+    local f = io.popen("wpa_cli -i wlan0 signal_poll 2>/dev/null")
+    if not f then return nil end
+    local out = f:read("*a")
+    f:close()
+    local rssi = out and out:match("RSSI=(-?%d+)")
+    return rssi and tonumber(rssi) or nil
 end
 
 -- Drives luamqtt manually, once per our own poll tick, instead of the
@@ -246,6 +274,9 @@ local function mqttConnect(settings)
             client:subscribe{ topic = "kindle_dashboard/frontlight_allowed/set" }
             client:subscribe{ topic = "kindle_dashboard/frontlight_auto_off_s/set" }
             client:subscribe{ topic = "kindle_dashboard/frontlight_brightness/set" }
+            client:subscribe{ topic = "kindle_dashboard/restart/set" }
+            client:subscribe{ topic = "kindle_dashboard/force_refresh/set" }
+            client:subscribe{ topic = "kindle_dashboard/mqtt_tick_interval_s/set" }
         end,
         message = function(msg)
             if msg.topic == "kindle_dashboard/power_saving/set" then
@@ -261,6 +292,21 @@ local function mqttConnect(settings)
             elseif msg.topic == "kindle_dashboard/frontlight_brightness/set" then
                 local n = tonumber(msg.payload)
                 if n then fl_wake_brightness = math.max(0, math.min(24, math.floor(n))) end
+            elseif msg.topic == "kindle_dashboard/restart/set" then
+                -- Same mechanism deploy.sh uses: upstart's koreader-
+                -- autostart job is "respawn", so killing this process
+                -- relaunches KOReader fresh -- a remote recovery button
+                -- that doesn't need SSH.
+                -- Backgrounded with a delay, detached, so the kill lands
+                -- after this call (and the current MQTT tick) returns
+                -- cleanly, rather than cutting the running process off
+                -- mid-call.
+                os.execute("sh -c 'sleep 1 && killall -q luajit' >/dev/null 2>&1 &")
+            elseif msg.topic == "kindle_dashboard/force_refresh/set" then
+                force_refresh_requested = true
+            elseif msg.topic == "kindle_dashboard/mqtt_tick_interval_s/set" then
+                local n = tonumber(msg.payload)
+                if n then mqtt_tick_interval_s = math.max(1, math.min(30, n)) end
             end
         end,
         error = function(err)
@@ -386,6 +432,90 @@ local function mqttPublishDiscovery()
         }),
         retain = true,
     }
+    mqtt_client:publish{
+        topic = "homeassistant/sensor/kindle_dashboard/wifi_rssi/config",
+        payload = JSON.encode(withAvailability{
+            name = "Wi-Fi Signal",
+            unique_id = "kindle_dashboard_wifi_rssi",
+            device_class = "signal_strength",
+            unit_of_measurement = "dBm",
+            state_topic = "kindle_dashboard/wifi_rssi/state",
+            device = MQTT_DEVICE,
+        }),
+        retain = true,
+    }
+    mqtt_client:publish{
+        topic = "homeassistant/binary_sensor/kindle_dashboard/frontlight_on/config",
+        payload = JSON.encode(withAvailability{
+            name = "Frontlight On",
+            unique_id = "kindle_dashboard_frontlight_on",
+            state_topic = "kindle_dashboard/frontlight_on/state",
+            payload_on = "ON",
+            payload_off = "OFF",
+            device = MQTT_DEVICE,
+        }),
+        retain = true,
+    }
+    mqtt_client:publish{
+        topic = "homeassistant/binary_sensor/kindle_dashboard/charging/config",
+        payload = JSON.encode(withAvailability{
+            name = "Charging",
+            unique_id = "kindle_dashboard_charging",
+            device_class = "battery_charging",
+            state_topic = "kindle_dashboard/charging/state",
+            payload_on = "ON",
+            payload_off = "OFF",
+            device = MQTT_DEVICE,
+        }),
+        retain = true,
+    }
+    mqtt_client:publish{
+        topic = "homeassistant/sensor/kindle_dashboard/last_poll/config",
+        payload = JSON.encode(withAvailability{
+            name = "Last Successful Poll",
+            unique_id = "kindle_dashboard_last_poll",
+            device_class = "timestamp",
+            state_topic = "kindle_dashboard/last_poll/state",
+            device = MQTT_DEVICE,
+        }),
+        retain = true,
+    }
+    mqtt_client:publish{
+        topic = "homeassistant/button/kindle_dashboard/restart/config",
+        payload = JSON.encode(withAvailability{
+            name = "Restart Dashboard",
+            unique_id = "kindle_dashboard_restart",
+            device_class = "restart",
+            command_topic = "kindle_dashboard/restart/set",
+            device = MQTT_DEVICE,
+        }),
+        retain = true,
+    }
+    mqtt_client:publish{
+        topic = "homeassistant/button/kindle_dashboard/force_refresh/config",
+        payload = JSON.encode(withAvailability{
+            name = "Force Refresh",
+            unique_id = "kindle_dashboard_force_refresh",
+            command_topic = "kindle_dashboard/force_refresh/set",
+            device = MQTT_DEVICE,
+        }),
+        retain = true,
+    }
+    mqtt_client:publish{
+        topic = "homeassistant/number/kindle_dashboard/mqtt_tick_interval_s/config",
+        payload = JSON.encode(withAvailability{
+            name = "MQTT Tick Interval",
+            unique_id = "kindle_dashboard_mqtt_tick_interval_s",
+            state_topic = "kindle_dashboard/mqtt_tick_interval_s/state",
+            command_topic = "kindle_dashboard/mqtt_tick_interval_s/set",
+            min = 1,
+            max = 30,
+            step = 1,
+            unit_of_measurement = "s",
+            device = MQTT_DEVICE,
+        }),
+        retain = true,
+    }
     mqtt_discovery_sent = true
 end
 
@@ -430,6 +560,19 @@ local function mqttTick(settings, battery_pct)
         mqtt_client:publish{ topic = "kindle_dashboard/frontlight_auto_off_s/state", payload = tostring(fl_auto_off_s), retain = true }
         mqtt_client:publish{ topic = "kindle_dashboard/frontlight_brightness/state", payload = tostring(fl_wake_brightness), retain = true }
         mqtt_client:publish{ topic = "kindle_dashboard/power_saving_active/state", payload = "OFF", retain = true }
+        local rssi = getWifiRssi()
+        if rssi then
+            mqtt_client:publish{ topic = "kindle_dashboard/wifi_rssi/state", payload = tostring(rssi), retain = true }
+        end
+        local powerd = Device:getPowerDevice()
+        if powerd then
+            mqtt_client:publish{ topic = "kindle_dashboard/frontlight_on/state", payload = powerd:isFrontlightOn() and "ON" or "OFF", retain = true }
+            mqtt_client:publish{ topic = "kindle_dashboard/charging/state", payload = powerd:isCharging() and "ON" or "OFF", retain = true }
+        end
+        if last_poll_ok_time then
+            mqtt_client:publish{ topic = "kindle_dashboard/last_poll/state", payload = os.date("!%Y-%m-%dT%H:%M:%SZ", last_poll_ok_time), retain = true }
+        end
+        mqtt_client:publish{ topic = "kindle_dashboard/mqtt_tick_interval_s/state", payload = tostring(mqtt_tick_interval_s), retain = true }
     end
 end
 
@@ -1726,9 +1869,13 @@ function HaDashboard:scheduleMqttTick()
         if self._closed or ps_sleeping then return end
         mqttTick(self.settings, nil)
         self:syncPsIcon()
+        if force_refresh_requested then
+            force_refresh_requested = false
+            self:refreshAllTiles()
+        end
         self:scheduleMqttTick()
     end
-    UIManager:scheduleIn(3, self._mqtt_task)
+    UIManager:scheduleIn(mqtt_tick_interval_s, self._mqtt_task)
 end
 
 -- Toggling Power Saving from HA updates the module-level ps_armed
@@ -1946,6 +2093,20 @@ function HaDashboard:refreshAllTiles()
     self:refreshHeaderBadges()
     self._poll_cache = nil
     self:setStale(any_failed)
+    if any_failed then
+        -- The one-shot setWifiEnabled(true) in wakeFromPowerSaving only
+        -- fires on the asleep->awake transition. If that single
+        -- lipc-set-prop call doesn't actually bring the radio back up
+        -- (seen in practice: device stays touch-responsive -- local-only
+        -- ops keep last_activity moving, so there's no sleep/wake cycle
+        -- to retry on -- but every poll fails with "Network is
+        -- unreachable" indefinitely). Re-asserting it here on every
+        -- failed poll is cheap and idempotent, and is the only other
+        -- place that can retry it.
+        setWifiEnabled(true)
+    else
+        last_poll_ok_time = os.time()
+    end
     mqttTick(self.settings, battery)
 end
 
