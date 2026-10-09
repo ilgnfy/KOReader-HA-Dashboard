@@ -74,6 +74,7 @@ Arm/disarm it by tapping the "PS" icon next to the gear in the header, or remote
 If `mqtt_host` is set, the plugin connects to that broker and publishes Home Assistant MQTT Discovery config for a single "Kindle Dashboard" Device, bundling:
 - A battery sensor (the Kindle's own battery %).
 - A switch for Power Saving mode (readable and writable from HA — arm it remotely when you're away, and the dashboard's own icon reflects HA-side changes on the next poll).
+- A switch for "Frontlight Allowed" (readable and writable from HA — e.g. drive it from a lux-sensor + time-of-day automation so taps don't turn the frontlight on during the day; see `frontlight_entity` below, which this replaces for MQTT users — no separate helper entity needed).
 
 No HA-side setup beyond having the MQTT integration enabled (if you already run Zigbee2MQTT, you already have both a broker and that integration). The device and entities appear automatically the first time the Kindle connects. Uses a small vendored copy of [`xHasKx/luamqtt`](https://github.com/xHasKx/luamqtt) (MIT), driven manually once per poll tick rather than via its own blocking event loop, to fit KOReader's cooperative scheduler.
 

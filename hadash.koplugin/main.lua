@@ -216,10 +216,13 @@ local function mqttConnect(settings)
         connect = function()
             mqtt_discovery_sent = false
             client:subscribe{ topic = "kindle_dashboard/power_saving/set" }
+            client:subscribe{ topic = "kindle_dashboard/frontlight_allowed/set" }
         end,
         message = function(msg)
             if msg.topic == "kindle_dashboard/power_saving/set" then
                 ps_armed = (tostring(msg.payload) == "ON")
+            elseif msg.topic == "kindle_dashboard/frontlight_allowed/set" then
+                fl_allowed = (tostring(msg.payload) == "ON")
             end
         end,
         error = function(err)
@@ -257,6 +260,17 @@ local function mqttPublishDiscovery()
         },
         retain = true,
     }
+    mqtt_client:publish{
+        topic = "homeassistant/switch/kindle_dashboard/frontlight_allowed/config",
+        payload = JSON.encode{
+            name = "Frontlight Allowed",
+            unique_id = "kindle_dashboard_frontlight_allowed",
+            state_topic = "kindle_dashboard/frontlight_allowed/state",
+            command_topic = "kindle_dashboard/frontlight_allowed/set",
+            device = MQTT_DEVICE,
+        },
+        retain = true,
+    }
     mqtt_discovery_sent = true
 end
 
@@ -290,6 +304,7 @@ local function mqttTick(settings, battery_pct)
             mqtt_client:publish{ topic = "kindle_dashboard/battery/state", payload = tostring(battery_pct), retain = true }
         end
         mqtt_client:publish{ topic = "kindle_dashboard/power_saving/state", payload = ps_armed and "ON" or "OFF", retain = true }
+        mqtt_client:publish{ topic = "kindle_dashboard/frontlight_allowed/state", payload = fl_allowed and "ON" or "OFF", retain = true }
     end
 end
 

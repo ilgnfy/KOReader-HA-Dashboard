@@ -88,5 +88,9 @@ return {
     -- Leave nil and tapping always turns it on. Ignored while Power
     -- Saving mode is asleep -- that mode's own frontlight-off always
     -- wins, and the tap that wakes it also re-triggers this logic.
+    -- If mqtt_host is set below, you don't need this at all -- a
+    -- "Frontlight Allowed" switch is auto-discovered as part of the
+    -- same bundled Device, no separate helper entity required. This
+    -- setting is only for a REST-polled entity instead/as well.
     frontlight_entity = nil, -- e.g. "input_boolean.kindle_frontlight_allowed"
 }
