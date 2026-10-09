@@ -1224,17 +1224,24 @@ function HaDashboard:init()
     end
 
     if settings.lights_onoff and #settings.lights_onoff > 0 then
-        table.insert(rows, VerticalSpan:new{ width = GUTTER })
+        -- Rows of 2 (not one row stretched to fit N) -- an odd entry at
+        -- the end gets its own row with just the left slot filled, not
+        -- stretched to fill both.
         local tile_w = (content_w - GUTTER) / 2
         local tile_h = Screen:scaleBySize(60)
-        local tile_row = {}
-        for i, light in ipairs(settings.lights_onoff) do
-            table.insert(tile_row, buildOnOffTile(settings, light, states[light.entity], tile_w, tile_h, self))
-            if i < #settings.lights_onoff then
+        for i = 1, #settings.lights_onoff, 2 do
+            table.insert(rows, VerticalSpan:new{ width = GUTTER })
+            local left_light = settings.lights_onoff[i]
+            local right_light = settings.lights_onoff[i + 1]
+            local tile_row = {
+                buildOnOffTile(settings, left_light, states[left_light.entity], tile_w, tile_h, self),
+            }
+            if right_light then
                 table.insert(tile_row, HorizontalSpan:new{ width = GUTTER })
+                table.insert(tile_row, buildOnOffTile(settings, right_light, states[right_light.entity], tile_w, tile_h, self))
             end
+            table.insert(rows, HorizontalGroup:new(tile_row))
         end
-        table.insert(rows, HorizontalGroup:new(tile_row))
     end
 
     if settings.lights_dimmable and #settings.lights_dimmable > 0 then
