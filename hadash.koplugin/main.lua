@@ -169,6 +169,11 @@ local mqtt_discovery_sent = false
 local ps_armed = false
 local ps_sleeping = false
 local last_activity = os.time()
+-- Whether a tap is currently allowed to turn the frontlight on at all
+-- (e.g. an HA automation says "too bright outside, don't bother") --
+-- true (always allowed) when frontlight_entity isn't configured.
+local fl_allowed = true
+local fl_off_task = nil
 
 local MQTT_DEVICE = {
     identifiers = { "kindle_dashboard" },
@@ -1571,6 +1576,28 @@ function HaDashboard:onInputEvent()
     last_activity = os.time()
     if ps_sleeping then
         self:wakeFromPowerSaving()
+        -- Falls through to the frontlight logic below too, so the tap
+        -- that wakes it also turns the light on (if allowed) instead of
+        -- needing a second tap.
+    end
+    -- Tap-to-light: turn the frontlight on on any tap (if allowed right
+    -- now -- see fl_allowed above), auto-off again after 30s of no
+    -- further taps. Replaces KOReader's own generic autodim timer
+    -- (disabled in settings.reader.lua), which had no way to gate on an
+    -- HA condition and fought any attempt to control it from here.
+    if fl_allowed then
+        local powerd = Device:getPowerDevice()
+        if powerd and not powerd:isFrontlightOn() then
+            powerd:turnOnFrontlight()
+        end
+        if fl_off_task then
+            UIManager:unschedule(fl_off_task)
+        end
+        fl_off_task = function()
+            local powerd2 = Device:getPowerDevice()
+            if powerd2 then powerd2:turnOffFrontlight() end
+        end
+        UIManager:scheduleIn(30, fl_off_task)
     end
 end
 
@@ -1582,9 +1609,12 @@ function HaDashboard:enterPowerSaving()
     end
     mqttDisconnect()
     setWifiEnabled(false)
+    if fl_off_task then
+        UIManager:unschedule(fl_off_task)
+        fl_off_task = nil
+    end
     local powerd = Device:getPowerDevice()
     if powerd and powerd:isFrontlightOn() then
-        self._ps_frontlight_was_on = true
         powerd:turnOffFrontlight()
     end
     -- InfoMessage already vanishes on its own on any key/tap press; our
@@ -1606,11 +1636,6 @@ function HaDashboard:wakeFromPowerSaving()
         self._ps_overlay = nil
     end
     setWifiEnabled(true)
-    if self._ps_frontlight_was_on then
-        local powerd = Device:getPowerDevice()
-        if powerd then powerd:turnOnFrontlight() end
-        self._ps_frontlight_was_on = nil
-    end
     self:schedulePoll()
     -- Wi-Fi needs a moment to reassociate -- same reasoning as the
     -- existing scene/all-lights double-refresh delay.
@@ -1712,23 +1737,16 @@ function HaDashboard:refreshAllTiles()
     -- One combined fetch for every tile this tick instead of one GET per
     -- tile's own closure (see fetchAllStates/haGetCached above).
     self._poll_cache = fetchAllStates(self.settings)
-    -- Optional: let an HA entity (e.g. a lux-sensor-driven automation)
-    -- decide whether the frontlight should be on, instead of KOReader's
-    -- own generic idle timer (autodim_starttime_minutes, disabled in
-    -- settings.reader.lua for this to take over cleanly). Skipped while
-    -- Power Saving is asleep -- that mode's own frontlight-off takes
-    -- priority and this would otherwise immediately fight it back on.
-    if self.settings.frontlight_entity and not ps_sleeping then
+    -- Optional: an HA entity (e.g. a lux-sensor-driven automation with a
+    -- time-of-day condition) gates whether tapping is ALLOWED to turn
+    -- the frontlight on at all -- e.g. off during the day when there's
+    -- enough ambient light. This just refreshes the cached flag; the
+    -- actual on-tap-turn-on + 30s-auto-off behavior lives in
+    -- onInputEvent/scheduleFrontlightOff below, not here.
+    if self.settings.frontlight_entity then
         local fl_state = haGetCached(self, self.settings, self.settings.frontlight_entity)
-        local powerd2 = Device:getPowerDevice()
-        if fl_state and powerd2 then
-            local want_on = fl_state.state == "on"
-            local is_on = powerd2:isFrontlightOn()
-            if want_on and not is_on then
-                powerd2:turnOnFrontlight()
-            elseif not want_on and is_on then
-                powerd2:turnOffFrontlight()
-            end
+        if fl_state then
+            fl_allowed = (fl_state.state == "on")
         end
     end
     local any_failed = false

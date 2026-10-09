@@ -78,13 +78,15 @@ return {
     mqtt_user = nil,
     mqtt_password = nil,
 
-    -- Optional: let an HA entity decide whether the frontlight is on
-    -- (e.g. a lux-sensor-driven automation, exposed as a light/switch/
-    -- input_boolean whose state is "on"/"off"), instead of KOReader's
-    -- own generic idle-dimmer. If you set this, also disable KOReader's
-    -- own autodim (Settings -> Screen -> dim after inactivity, or set
-    -- autodim_starttime_minutes to -1 in settings.reader.lua) so the two
-    -- don't fight each other. Ignored while Power Saving mode is asleep
-    -- -- that mode's own frontlight-off always takes priority.
-    frontlight_entity = nil, -- e.g. "input_boolean.kindle_frontlight"
+    -- Optional: tapping the screen turns the frontlight on, auto-off
+    -- again after 30s of no further taps -- this replaces KOReader's
+    -- own generic autodim timer (already disabled in settings.reader.lua,
+    -- autodim_starttime_minutes = -1, so the two don't fight). Set this
+    -- to an HA entity ("on"/"off" state) to gate WHETHER a tap is even
+    -- allowed to turn it on at all -- e.g. a lux-sensor-driven automation
+    -- that says "off" during the day when there's enough ambient light.
+    -- Leave nil and tapping always turns it on. Ignored while Power
+    -- Saving mode is asleep -- that mode's own frontlight-off always
+    -- wins, and the tap that wakes it also re-triggers this logic.
+    frontlight_entity = nil, -- e.g. "input_boolean.kindle_frontlight_allowed"
 }
