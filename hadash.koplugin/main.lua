@@ -224,6 +224,14 @@ local function mqttConnect(settings)
         -- mqttDisconnect), since waiting for the broker's own keepalive-
         -- timeout detection would be slower than doing it ourselves.
         will = { topic = "kindle_dashboard/availability", payload = "offline", retain = true },
+        -- Without this, the underlying library's _ioloop_iteration gives
+        -- up and removes itself from the ioloop after exactly one failed
+        -- connect attempt (e.g. Wi-Fi not reassociated yet right after
+        -- waking) -- mqtt_client then stays permanently set to a dead,
+        -- never-connected client, so mqttTick's own "recreate if nil"
+        -- fallback never kicks in either. This was the actual cause of
+        -- entities staying unavailable in HA after a wake.
+        reconnect = true,
     })
     if not ok or not client then
         logger.warn("hadash: mqtt client creation failed", client)
@@ -302,6 +310,22 @@ local function mqttPublishDiscovery()
             command_topic = "kindle_dashboard/power_saving/set",
             device = MQTT_DEVICE,
         }),
+        retain = true,
+    }
+    -- Deliberately NOT wrapped in withAvailability -- this is the one
+    -- entity meant to stay showing its last value (ON) while the device
+    -- is actually asleep and everything else goes gray, so HA can tell
+    -- "asleep" apart from "unreachable for some other reason".
+    mqtt_client:publish{
+        topic = "homeassistant/binary_sensor/kindle_dashboard/power_saving_active/config",
+        payload = JSON.encode{
+            name = "Power Saving Active",
+            unique_id = "kindle_dashboard_power_saving_active",
+            state_topic = "kindle_dashboard/power_saving_active/state",
+            payload_on = "ON",
+            payload_off = "OFF",
+            device = MQTT_DEVICE,
+        },
         retain = true,
     }
     mqtt_client:publish{
@@ -405,6 +429,7 @@ local function mqttTick(settings, battery_pct)
         mqtt_client:publish{ topic = "kindle_dashboard/frontlight_allowed/state", payload = fl_allowed and "ON" or "OFF", retain = true }
         mqtt_client:publish{ topic = "kindle_dashboard/frontlight_auto_off_s/state", payload = tostring(fl_auto_off_s), retain = true }
         mqtt_client:publish{ topic = "kindle_dashboard/frontlight_brightness/state", payload = tostring(fl_wake_brightness), retain = true }
+        mqtt_client:publish{ topic = "kindle_dashboard/power_saving_active/state", payload = "OFF", retain = true }
     end
 end
 
@@ -1700,9 +1725,28 @@ function HaDashboard:scheduleMqttTick()
     self._mqtt_task = function()
         if self._closed or ps_sleeping then return end
         mqttTick(self.settings, nil)
+        self:syncPsIcon()
         self:scheduleMqttTick()
     end
     UIManager:scheduleIn(3, self._mqtt_task)
+end
+
+-- Toggling Power Saving from HA updates the module-level ps_armed
+-- variable (see mqttConnect's message handler), but nothing about that
+-- repaints the actual on-screen icon -- the icon is otherwise only ever
+-- set at initial build time and by the local tap callback. Checked
+-- alongside the fast MQTT ticker so a remote toggle shows up within a
+-- few seconds, same as how fast a remote command is now applied.
+function HaDashboard:syncPsIcon()
+    if self._closed then return end
+    local btn = self.stale_frame and self.stale_frame.ps_btn
+    if not btn then return end
+    local want_black = ps_armed
+    local is_black = btn.frame.background == Blitbuffer.COLOR_BLACK
+    if want_black == is_black then return end
+    btn.frame.background = want_black and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE
+    btn.label_widget.fgcolor = want_black and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK
+    partialRefresh(self, self.stale_frame)
 end
 
 function HaDashboard:onInputEvent()
@@ -1745,6 +1789,11 @@ function HaDashboard:enterPowerSaving()
     end
     if self._mqtt_task then
         UIManager:unschedule(self._mqtt_task)
+    end
+    if mqtt_client and mqtt_client.connection then
+        pcall(function()
+            mqtt_client:publish{ topic = "kindle_dashboard/power_saving_active/state", payload = "ON", retain = true }
+        end)
     end
     mqttDisconnect()
     setWifiEnabled(false)
