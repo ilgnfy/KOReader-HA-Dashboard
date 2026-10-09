@@ -839,6 +839,13 @@ local function buildOnOffTile(settings, light, state, width, height, dashboard_s
                 syncFromServer()
                 dashboard_self:refreshHeaderBadges()
             end)
+            -- Any action might be part of an HA automation touching other
+            -- entities too (or was done from a phone seconds earlier) --
+            -- resync the whole dashboard, not just this tile, same as the
+            -- scene/all-lights actions already do. Twice: once past
+            -- typical propagation lag, once more for stragglers.
+            UIManager:scheduleIn(0.8, function() dashboard_self:refreshAllTiles() end)
+            UIManager:scheduleIn(2.5, function() dashboard_self:refreshAllTiles() end)
         end,
     }
     if is_on then whiten(toggle_btn) end
@@ -943,6 +950,8 @@ local function buildDimmableCard(settings, light, state, width, dashboard_self)
                 refreshFromServer()
                 dashboard_self:refreshHeaderBadges()
             end)
+            UIManager:scheduleIn(0.8, function() dashboard_self:refreshAllTiles() end)
+            UIManager:scheduleIn(2.5, function() dashboard_self:refreshAllTiles() end)
         end,
     }
     if is_on then whiten(toggle_btn) end
@@ -968,6 +977,8 @@ local function buildDimmableCard(settings, light, state, width, dashboard_self)
                 refreshFromServer()
                 dashboard_self:refreshHeaderBadges()
             end)
+            UIManager:scheduleIn(0.8, function() dashboard_self:refreshAllTiles() end)
+            UIManager:scheduleIn(2.5, function() dashboard_self:refreshAllTiles() end)
         end
         UIManager:scheduleIn(0.3, send_task)
     end
@@ -1027,6 +1038,19 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
     local selected = 1
     local card, current_text, humidity_text, target_text, heat_btn
     local selector_btns = {}
+    -- Shared debounce for the full-dashboard resync below -- the preset/
+    -- temp-step buttons can get tapped several times in quick succession,
+    -- and re-scheduling instead of stacking keeps that from queuing up a
+    -- pile of redundant refreshes (and e-ink flashes) for one intent.
+    local full_refresh_task1, full_refresh_task2
+    local function scheduleFullRefresh()
+        if full_refresh_task1 then UIManager:unschedule(full_refresh_task1) end
+        if full_refresh_task2 then UIManager:unschedule(full_refresh_task2) end
+        full_refresh_task1 = function() dashboard_self:refreshAllTiles() end
+        full_refresh_task2 = function() dashboard_self:refreshAllTiles() end
+        UIManager:scheduleIn(0.8, full_refresh_task1)
+        UIManager:scheduleIn(2.5, full_refresh_task2)
+    end
 
     -- Ambient humidity, shown next to the current temperature (same
     -- source that used to be the header's own temp/humidity chip, now
@@ -1129,6 +1153,7 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
             end
         end
         UIManager:scheduleIn(0.4, refreshFromServer)
+        scheduleFullRefresh()
     end
 
     for i, heater in ipairs(heaters) do
@@ -1211,6 +1236,7 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
                 refreshFromServer()
                 dashboard_self:refreshHeaderBadges()
             end)
+            scheduleFullRefresh()
         end,
     }
     if initial_is_heat then whiten(heat_btn) end
@@ -1231,6 +1257,7 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
                 refreshFromServer()
                 dashboard_self:refreshHeaderBadges()
             end)
+            scheduleFullRefresh()
         end
     end
 
@@ -1300,6 +1327,7 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
                 refreshFromServer()
                 dashboard_self:refreshHeaderBadges()
             end)
+            scheduleFullRefresh()
             end,
         })
     end
@@ -1973,12 +2001,22 @@ function HaDashboard:wakeFromPowerSaving()
     setWifiEnabled(true)
     self:schedulePoll()
     self:scheduleMqttTick()
-    -- Wi-Fi needs a moment to reassociate -- same reasoning as the
-    -- existing scene/all-lights double-refresh delay.
-    UIManager:scheduleIn(3, function()
-        if self._closed then return end
-        self:refreshAllTiles()
-    end)
+    -- Wi-Fi needs a moment to reassociate, and you may well have changed
+    -- something from your phone while this was asleep -- retry (not just
+    -- one shot) until a refresh actually succeeds, so every tile is
+    -- showing real HA state again before you touch anything, instead of
+    -- silently failing once and waiting out the rest of the normal poll
+    -- interval if reassociation happened to take longer than 3s.
+    local attempts_left = 5
+    local function tryRefresh()
+        if self._closed or ps_sleeping then return end
+        local ok = self:refreshAllTiles()
+        attempts_left = attempts_left - 1
+        if not ok and attempts_left > 0 then
+            UIManager:scheduleIn(3, tryRefresh)
+        end
+    end
+    UIManager:scheduleIn(3, tryRefresh)
 end
 
 -- Shows/clears the header's stale-connection indicator. No-ops if nothing
@@ -2108,6 +2146,7 @@ function HaDashboard:refreshAllTiles()
         last_poll_ok_time = os.time()
     end
     mqttTick(self.settings, battery)
+    return not any_failed
 end
 
 -- Periodic tick (milestone 4, "robustness"). Every Nth tick instead does
