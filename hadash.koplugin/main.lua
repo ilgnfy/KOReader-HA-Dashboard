@@ -26,6 +26,7 @@ local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local http = require("socket.http")
 local ltn12 = require("ltn12")
 local logger = require("logger")
+local mqtt = require("mqttlib")
 local _ = require("gettext")
 
 -- Without this, a request that hangs instead of failing fast (brief Wi-Fi
@@ -124,6 +125,166 @@ local function haCallService(settings, domain, service, payload)
         logger.warn("hadash: service call failed", domain, service, ok, code)
     end
     return success
+end
+
+-- Pushes a state TO Home Assistant instead of reading one -- the
+-- "sensor.kindle_battery"-style direction. HA's REST API accepts a plain
+-- POST /api/states/<entity_id> from any authenticated client and creates
+-- the entity if it doesn't exist yet; no integration config needed on
+-- the HA side. (These push-created states aren't restored across an HA
+-- restart the way a real integration's sensors are -- fine here, since
+-- this plugin re-pushes the value every poll anyway.)
+local function haSetState(settings, entity_id, state, attributes)
+    local body = JSON.encode({ state = state, attributes = attributes })
+    local ok, code = http.request{
+        url = settings.ha_url .. "/api/states/" .. entity_id,
+        method = "POST",
+        headers = {
+            ["Authorization"] = "Bearer " .. settings.ha_token,
+            ["Content-Type"] = "application/json",
+            ["Content-Length"] = tostring(#body),
+        },
+        source = ltn12.source.string(body),
+        sink = ltn12.sink.table({}),
+    }
+    local success = ok and (code == 200 or code == 201)
+    if not success then
+        logger.warn("hadash: set state failed", entity_id, ok, code)
+    end
+    return success
+end
+
+----------------------------------------------------------------
+-- Power Saving mode + MQTT (HA auto-discovery, bundled as one Device)
+----------------------------------------------------------------
+
+-- Module-level, not per-instance: the MQTT connection and Power Saving
+-- state need to survive the periodic full-dashboard-rebuild (every
+-- FULL_REFRESH_EVERY_N_POLLS ticks creates a brand new HaDashboard
+-- instance), same reasoning as active_dashboard/has_auto_opened below.
+local mqtt_client = nil
+local mqtt_ioloop = nil
+local mqtt_discovery_sent = false
+local ps_armed = false
+local ps_sleeping = false
+local last_activity = os.time()
+
+local MQTT_DEVICE = {
+    identifiers = { "kindle_dashboard" },
+    name = "Kindle Dashboard",
+    manufacturer = "hadash.koplugin",
+    model = "Kindle Paperwhite 3",
+}
+
+-- Real OS-level suspend powers down the touch controller itself (verified
+-- this session -- that's exactly why touch stayed dead until a power-
+-- button press before preventScreenSaver was set). "Power Saving" here
+-- is deliberately a software-only pause instead: Wi-Fi radio off,
+-- frontlight off, polling paused -- the CPU/touch controller/KOReader
+-- process stay fully live throughout, so any tap wakes instantly.
+local function setWifiEnabled(enabled)
+    os.execute("lipc-set-prop com.lab126.cmd wirelessEnable " .. (enabled and "1" or "0"))
+end
+
+-- Drives luamqtt manually, once per our own poll tick, instead of the
+-- library's own blocking mqtt.run_ioloop -- that would never return
+-- control to KOReader's cooperative scheduler. Attaching a real ioloop
+-- object (for its timeout config only, 50ms here) is what makes the
+-- client's socket reads bounded instead of blocking indefinitely
+-- (client.lua's _apply_network_timeout disables the timeout entirely
+-- when no ioloop is attached).
+local function mqttConnect(settings)
+    if not settings.mqtt_host or mqtt_client then return end
+    local ok, client = pcall(mqtt.client, {
+        uri = settings.mqtt_host .. ":" .. (settings.mqtt_port or 1883),
+        id = "kindle_dashboard",
+        username = settings.mqtt_user,
+        password = settings.mqtt_password,
+        clean = true,
+    })
+    if not ok or not client then
+        logger.warn("hadash: mqtt client creation failed", client)
+        return
+    end
+    client:on{
+        connect = function()
+            mqtt_discovery_sent = false
+            client:subscribe{ topic = "kindle_dashboard/power_saving/set" }
+        end,
+        message = function(msg)
+            if msg.topic == "kindle_dashboard/power_saving/set" then
+                ps_armed = (tostring(msg.payload) == "ON")
+            end
+        end,
+        error = function(err)
+            logger.warn("hadash: mqtt error", err)
+        end,
+    }
+    mqtt_ioloop = require("mqtt.ioloop").get(true, { timeout = 0.05 })
+    mqtt_ioloop:add(client)
+    client:start_connecting()
+    mqtt_client = client
+end
+
+local function mqttPublishDiscovery()
+    if not mqtt_client or mqtt_discovery_sent then return end
+    mqtt_client:publish{
+        topic = "homeassistant/sensor/kindle_dashboard/battery/config",
+        payload = JSON.encode{
+            name = "Battery",
+            unique_id = "kindle_dashboard_battery",
+            device_class = "battery",
+            unit_of_measurement = "%",
+            state_topic = "kindle_dashboard/battery/state",
+            device = MQTT_DEVICE,
+        },
+        retain = true,
+    }
+    mqtt_client:publish{
+        topic = "homeassistant/switch/kindle_dashboard/power_saving/config",
+        payload = JSON.encode{
+            name = "Power Saving",
+            unique_id = "kindle_dashboard_power_saving",
+            state_topic = "kindle_dashboard/power_saving/state",
+            command_topic = "kindle_dashboard/power_saving/set",
+            device = MQTT_DEVICE,
+        },
+        retain = true,
+    }
+    mqtt_discovery_sent = true
+end
+
+local function mqttDisconnect()
+    if not mqtt_client then return end
+    pcall(function() mqtt_client:disconnect() end)
+    mqtt_client = nil
+    mqtt_discovery_sent = false
+end
+
+-- Called once per normal (awake) poll tick. One bounded-timeout iteration
+-- of the client's own state machine (connect handshake, incoming message
+-- parsing, keepalive) -- never blocks noticeably given the 50ms ioloop
+-- timeout above.
+local function mqttTick(settings, battery_pct)
+    if not mqtt_client then
+        mqttConnect(settings)
+        return
+    end
+    local ok = pcall(function() return mqtt_client:_ioloop_iteration() end)
+    if not ok then
+        -- Connection died; drop it, mqttConnect will recreate it on a
+        -- later tick.
+        mqtt_client = nil
+        mqtt_discovery_sent = false
+        return
+    end
+    if mqtt_client.connection then
+        mqttPublishDiscovery()
+        if battery_pct then
+            mqtt_client:publish{ topic = "kindle_dashboard/battery/state", payload = tostring(battery_pct), retain = true }
+        end
+        mqtt_client:publish{ topic = "kindle_dashboard/power_saving/state", payload = ps_armed and "ON" or "OFF", retain = true }
+    end
 end
 
 -- Like haCallService, but asks HA to return the service's result payload
@@ -1025,7 +1186,7 @@ end
 -- (see buildClimateCard/humidity_sensor), filling whitespace that used to
 -- go unused next to the big number.
 
-local function buildHeader(width, power_badges, exit_callback)
+local function buildHeader(width, power_badges, exit_callback, ps_callback, ps_armed_initial)
     local height = Screen:scaleBySize(70)
     -- Power badges (battery/solar/consumption) sit left-aligned in the
     -- header itself now, in place of a greeting -- saves the separate
@@ -1064,11 +1225,30 @@ local function buildHeader(width, power_badges, exit_callback)
         text_font_size = 18,
         callback = exit_callback,
     }
+    -- Sits left of the gear, same reasoning as the gear sitting left of
+    -- the clock: a new icon goes next to its closest-related sibling,
+    -- not tacked onto the far edge. Filled black when Power Saving is
+    -- armed, outline when not -- same visual language as every other
+    -- toggle in this file.
+    local ps_btn = Button:new{
+        text = "PS",
+        width = Screen:scaleBySize(36),
+        height = Screen:scaleBySize(36),
+        background = ps_armed_initial and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE,
+        bordersize = Size.border.window,
+        radius = Screen:scaleBySize(18),
+        text_font_size = 13,
+        text_font_bold = true,
+        callback = ps_callback,
+    }
+    if ps_armed_initial then whiten(ps_btn) end
     local stale_frame = FrameContainer:new{
         bordersize = 0,
         padding = 0,
         HorizontalGroup:new{
             stale_text,
+            HorizontalSpan:new{ width = Size.span.horizontal_small },
+            ps_btn,
             HorizontalSpan:new{ width = Size.span.horizontal_small },
             exit_btn,
             HorizontalSpan:new{ width = Size.span.horizontal_default },
@@ -1077,6 +1257,7 @@ local function buildHeader(width, power_badges, exit_callback)
     }
     stale_frame.stale_text = stale_text
     stale_frame.time_text = time_text
+    stale_frame.ps_btn = ps_btn
     return OverlapGroup:new{
         dimen = { w = width, h = height },
         LeftContainer:new{
@@ -1202,6 +1383,8 @@ function HaDashboard:init()
     self.settings = settings
     self.poll_fns = {} -- populated by builders below; polled every POLL_INTERVAL_S
 
+    mqttConnect(settings)
+
     local states = fetchAllStates(settings)
     local forecast = fetchForecast(settings)
     local content_w = self.dimen.w - GUTTER * 2
@@ -1209,7 +1392,18 @@ function HaDashboard:init()
     self.power_badges = power_badges
     local header, stale_frame = buildHeader(content_w, power_badges, function()
         UIManager:close(self)
-    end)
+    end, function()
+        ps_armed = not ps_armed
+        if self.stale_frame and self.stale_frame.ps_btn then
+            local btn = self.stale_frame.ps_btn
+            btn.frame.background = ps_armed and Blitbuffer.COLOR_BLACK or Blitbuffer.COLOR_WHITE
+            btn.label_widget.fgcolor = ps_armed and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK
+            partialRefresh(self, self.stale_frame)
+        end
+        if mqtt_client and mqtt_client.connection then
+            mqtt_client:publish{ topic = "kindle_dashboard/power_saving/state", payload = ps_armed and "ON" or "OFF", retain = true }
+        end
+    end, ps_armed)
     self.stale_frame = stale_frame
     local rows = {
         header,
@@ -1360,6 +1554,56 @@ function HaDashboard:init()
         if self._closed then return end
         self:runPoll()
     end)
+
+    -- Global activity tracking for Power Saving mode: fires on every raw
+    -- input event regardless of which widget actually handles the
+    -- gesture (same mechanism KOReader's own autostandby.koplugin uses),
+    -- so a tap on an actual button counts as activity too, not just taps
+    -- that land on empty background. Auto-unregisters on close via the
+    -- wrapped onCloseWidget this sets up internally -- no manual cleanup
+    -- needed.
+    UIManager.event_hook:registerWidget("InputEvent", self)
+end
+
+function HaDashboard:onInputEvent()
+    last_activity = os.time()
+    if ps_sleeping then
+        self:wakeFromPowerSaving()
+    end
+end
+
+function HaDashboard:enterPowerSaving()
+    if ps_sleeping then return end
+    ps_sleeping = true
+    if self._poll_task then
+        UIManager:unschedule(self._poll_task)
+    end
+    mqttDisconnect()
+    setWifiEnabled(false)
+    local powerd = Device:getPowerDevice()
+    if powerd and powerd:isFrontlightOn() then
+        self._ps_frontlight_was_on = true
+        powerd:turnOffFrontlight()
+    end
+end
+
+function HaDashboard:wakeFromPowerSaving()
+    if not ps_sleeping then return end
+    ps_sleeping = false
+    last_activity = os.time()
+    setWifiEnabled(true)
+    if self._ps_frontlight_was_on then
+        local powerd = Device:getPowerDevice()
+        if powerd then powerd:turnOnFrontlight() end
+        self._ps_frontlight_was_on = nil
+    end
+    self:schedulePoll()
+    -- Wi-Fi needs a moment to reassociate -- same reasoning as the
+    -- existing scene/all-lights double-refresh delay.
+    UIManager:scheduleIn(3, function()
+        if self._closed then return end
+        self:refreshAllTiles()
+    end)
 end
 
 -- Shows/clears the header's stale-connection indicator. No-ops if nothing
@@ -1434,11 +1678,22 @@ end
 -- tapped), not just the one tile that was interacted with.
 function HaDashboard:refreshAllTiles()
     if self._closed then return end
+    local powerd = Device:getPowerDevice()
+    local battery = powerd and powerd:getCapacity()
     if self.stale_frame and self.stale_frame.time_text then
-        local powerd = Device:getPowerDevice()
-        local battery = powerd and powerd:getCapacity()
         self.stale_frame.time_text:setText(string.format("%s%s", os.date("%H:%M"), battery and ("  " .. battery .. "%") or ""))
         partialRefresh(self, self.stale_frame)
+    end
+    -- Report the Kindle's own battery back to HA as a sensor, not just
+    -- read entities from it -- optional, set kindle_battery_entity in
+    -- hadash_settings.lua to enable. haSetState creates the entity on
+    -- HA's side on first push if it doesn't already exist.
+    if self.settings.kindle_battery_entity and battery then
+        haSetState(self.settings, self.settings.kindle_battery_entity, battery, {
+            unit_of_measurement = "%",
+            device_class = "battery",
+            friendly_name = "Kindle Dashboard Battery",
+        })
     end
     -- One combined fetch for every tile this tick instead of one GET per
     -- tile's own closure (see fetchAllStates/haGetCached above).
@@ -1451,6 +1706,7 @@ function HaDashboard:refreshAllTiles()
     self:refreshHeaderBadges()
     self._poll_cache = nil
     self:setStale(any_failed)
+    mqttTick(self.settings, battery)
 end
 
 -- Periodic tick (milestone 4, "robustness"). Every Nth tick instead does
@@ -1459,6 +1715,13 @@ end
 -- partial updates in between.
 function HaDashboard:runPoll()
     if self._closed then return end
+    if ps_armed and not ps_sleeping then
+        local timeout = self.settings.power_saving_timeout_s or 300
+        if os.time() - last_activity >= timeout then
+            self:enterPowerSaving()
+            return
+        end
+    end
     self._poll_count = (self._poll_count or 0) + 1
     -- Power badges and scenes (and anything else whose presence depends
     -- on data available at build time) are structural -- decided once

@@ -15,6 +15,8 @@ A good always-on touch display for a home dashboard is normally expensive: e-ink
 - **Heating/climate**: current + target temperature, Heat/Off toggle, quick presets, a selector when you have more than one heater (mutually exclusive — picking one turns the others off).
 - **Weather** chip (condition, today's high/low, rain amount or probability depending on what your HA weather integration provides).
 - **Power/solar badges**: battery %, solar production, house consumption (optional).
+- **Power Saving mode**: after N idle minutes, pauses polling and turns Wi-Fi + the frontlight off — any tap wakes it instantly (no power button needed; this is a software pause, not real device suspend, which would kill touch responsiveness on this hardware). Armable from the dashboard's own "PS" icon, or remotely from Home Assistant.
+- **MQTT auto-discovery** (optional): if you have an MQTT broker, the plugin publishes a "Kindle Dashboard" Device to HA — bundling a battery sensor and the Power Saving switch under one Device card, zero manual HA-side setup.
 - Diff-and-redraw polling (only repaints tiles whose value changed), a stale/offline indicator, periodic full e-ink refresh to clear ghosting.
 - Boot autostart straight into the dashboard, with the native Kindle software stack disabled for battery life.
 
@@ -57,9 +59,23 @@ The emulator talks to your real Home Assistant but can't show real e-ink refresh
 
 ## Configuration
 
-See `config.sample.lua` for the full commented option list: `ha_url`, `ha_token`, `lights_onoff`, `lights_dimmable`, `scenes`, `all_lights_entity`, `climate_entities`, `sensors`, `weather_entity`, `battery_entity`/`solar_power_entity`/`consumption_entity` (all optional), `auto_open`.
+See `config.sample.lua` for the full commented option list: `ha_url`, `ha_token`, `lights_onoff`, `lights_dimmable`, `scenes`, `all_lights_entity`, `climate_entities`, `sensors`, `weather_entity`, `battery_entity`/`solar_power_entity`/`consumption_entity`, `kindle_battery_entity`, `power_saving_timeout_s`, `mqtt_host`/`mqtt_port`/`mqtt_user`/`mqtt_password` (all optional except `ha_url`/`ha_token`), `auto_open`.
 
 **Token permissions**: a non-admin HA user's token works fine for everything. The one thing it can't do is HA's `/api/template` endpoint, which this plugin uses to fetch all tile data in a single request instead of one request per entity — that endpoint requires an admin-level token. Non-admin falls back automatically to one request per entity. Your call on that trade-off.
+
+## Power Saving mode
+
+Real OS-level suspend on this hardware powers down the touch controller itself — there's no touch-wake from it, only a power-button press. So Power Saving mode here is a deliberate **software pause** instead: after `power_saving_timeout_s` idle seconds (default 300), it pauses polling, disables Wi-Fi (`lipc-set-prop com.lab126.cmd wirelessEnable 0`), and turns the frontlight off if it was on. The CPU and touch controller stay fully live throughout, so **any tap wakes it instantly**, reconnecting Wi-Fi and resuming polling within a few seconds.
+
+Arm/disarm it by tapping the "PS" icon next to the gear in the header, or remotely via the MQTT switch described below.
+
+## MQTT auto-discovery (optional)
+
+If `mqtt_host` is set, the plugin connects to that broker and publishes Home Assistant MQTT Discovery config for a single "Kindle Dashboard" Device, bundling:
+- A battery sensor (the Kindle's own battery %).
+- A switch for Power Saving mode (readable and writable from HA — arm it remotely when you're away, and the dashboard's own icon reflects HA-side changes on the next poll).
+
+No HA-side setup beyond having the MQTT integration enabled (if you already run Zigbee2MQTT, you already have both a broker and that integration). The device and entities appear automatically the first time the Kindle connects. Uses a small vendored copy of [`xHasKx/luamqtt`](https://github.com/xHasKx/luamqtt) (MIT), driven manually once per poll tick rather than via its own blocking event loop, to fit KOReader's cooperative scheduler.
 
 ## Appliance mode (boot straight into the dashboard, disable native Kindle software)
 
@@ -107,7 +123,7 @@ If something goes wrong with the appliance-mode setup and the device won't boot 
 
 ## Project layout
 
-- `hadash.koplugin/` — the plugin (`_meta.lua`, `main.lua`).
+- `hadash.koplugin/` — the plugin (`_meta.lua`, `main.lua`, `mqttlib.lua` + `mqtt/` — a vendored copy of [`xHasKx/luamqtt`](https://github.com/xHasKx/luamqtt), MIT).
 - `config.sample.lua` — settings template. Copy it, fill it in, never commit the filled-in copy.
 - `deploy.sh` — pushes the plugin to a Kindle over SSH, restarts KOReader.
 - `emulator.sh` — runs the KOReader emulator with the settings this project needs.

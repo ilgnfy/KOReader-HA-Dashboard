@@ -52,4 +52,29 @@ return {
     battery_entity = nil, -- e.g. "sensor.battery_state_of_charge"
     solar_power_entity = nil, -- e.g. "sensor.solar_production"
     consumption_entity = nil, -- e.g. "sensor.house_consumption"
+
+    -- Optional: report the Kindle's OWN battery level back to HA as a
+    -- sensor entity (HA creates it automatically on first push, no
+    -- integration config needed). Leave nil to not report anything.
+    kindle_battery_entity = nil, -- e.g. "sensor.kindle_dashboard_battery"
+
+    -- Optional: Power Saving mode. When armed (tap the "PS" icon next to
+    -- the gear, or flip the switch from HA once MQTT discovery below is
+    -- set up), the dashboard pauses polling, turns Wi-Fi off, and turns
+    -- the frontlight off after this many idle seconds -- any tap wakes
+    -- it instantly (this is a software pause, not real device suspend,
+    -- so the touch controller never actually powers down).
+    power_saving_timeout_s = 300,
+
+    -- Optional: MQTT broker for Home Assistant auto-discovery. If set,
+    -- this plugin publishes a "Kindle Dashboard" Device to HA (bundling
+    -- the battery sensor and the Power Saving switch under one Device
+    -- card) with zero manual HA-side setup -- no helper entities needed.
+    -- Requires an MQTT broker reachable from the Kindle and the MQTT
+    -- integration enabled in HA (if you already run Zigbee2MQTT, you
+    -- already have both).
+    mqtt_host = nil, -- e.g. "192.168.1.5"
+    mqtt_port = 1883,
+    mqtt_user = nil,
+    mqtt_password = nil,
 }
