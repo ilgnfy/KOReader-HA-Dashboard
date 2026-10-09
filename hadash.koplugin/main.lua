@@ -174,6 +174,9 @@ local last_activity = os.time()
 -- true (always allowed) when frontlight_entity isn't configured.
 local fl_allowed = true
 local fl_off_task = nil
+-- Both HA-adjustable via MQTT (number entities) -- see mqttPublishDiscovery.
+local fl_auto_off_s = 30
+local fl_wake_brightness = 12 -- native Kindle scale is 0-24, not 0-100
 
 local MQTT_DEVICE = {
     identifiers = { "kindle_dashboard" },
@@ -217,12 +220,20 @@ local function mqttConnect(settings)
             mqtt_discovery_sent = false
             client:subscribe{ topic = "kindle_dashboard/power_saving/set" }
             client:subscribe{ topic = "kindle_dashboard/frontlight_allowed/set" }
+            client:subscribe{ topic = "kindle_dashboard/frontlight_auto_off_s/set" }
+            client:subscribe{ topic = "kindle_dashboard/frontlight_brightness/set" }
         end,
         message = function(msg)
             if msg.topic == "kindle_dashboard/power_saving/set" then
                 ps_armed = (tostring(msg.payload) == "ON")
             elseif msg.topic == "kindle_dashboard/frontlight_allowed/set" then
                 fl_allowed = (tostring(msg.payload) == "ON")
+            elseif msg.topic == "kindle_dashboard/frontlight_auto_off_s/set" then
+                local n = tonumber(msg.payload)
+                if n then fl_auto_off_s = math.max(5, math.min(300, n)) end
+            elseif msg.topic == "kindle_dashboard/frontlight_brightness/set" then
+                local n = tonumber(msg.payload)
+                if n then fl_wake_brightness = math.max(0, math.min(24, math.floor(n))) end
             end
         end,
         error = function(err)
@@ -271,6 +282,38 @@ local function mqttPublishDiscovery()
         },
         retain = true,
     }
+    mqtt_client:publish{
+        topic = "homeassistant/number/kindle_dashboard/frontlight_auto_off_s/config",
+        payload = JSON.encode{
+            name = "Frontlight Auto-off Seconds",
+            unique_id = "kindle_dashboard_frontlight_auto_off_s",
+            state_topic = "kindle_dashboard/frontlight_auto_off_s/state",
+            command_topic = "kindle_dashboard/frontlight_auto_off_s/set",
+            min = 5,
+            max = 300,
+            step = 5,
+            unit_of_measurement = "s",
+            device = MQTT_DEVICE,
+        },
+        retain = true,
+    }
+    mqtt_client:publish{
+        topic = "homeassistant/number/kindle_dashboard/frontlight_brightness/config",
+        payload = JSON.encode{
+            name = "Frontlight Brightness on Wake",
+            unique_id = "kindle_dashboard_frontlight_brightness",
+            state_topic = "kindle_dashboard/frontlight_brightness/state",
+            command_topic = "kindle_dashboard/frontlight_brightness/set",
+            -- Native Kindle scale is 0-24, not 0-100 -- deliberately not
+            -- converting to %, to avoid rounding mismatches against what
+            -- setIntensity actually applies.
+            min = 0,
+            max = 24,
+            step = 1,
+            device = MQTT_DEVICE,
+        },
+        retain = true,
+    }
     mqtt_discovery_sent = true
 end
 
@@ -305,6 +348,8 @@ local function mqttTick(settings, battery_pct)
         end
         mqtt_client:publish{ topic = "kindle_dashboard/power_saving/state", payload = ps_armed and "ON" or "OFF", retain = true }
         mqtt_client:publish{ topic = "kindle_dashboard/frontlight_allowed/state", payload = fl_allowed and "ON" or "OFF", retain = true }
+        mqtt_client:publish{ topic = "kindle_dashboard/frontlight_auto_off_s/state", payload = tostring(fl_auto_off_s), retain = true }
+        mqtt_client:publish{ topic = "kindle_dashboard/frontlight_brightness/state", payload = tostring(fl_wake_brightness), retain = true }
     end
 end
 
@@ -1596,14 +1641,17 @@ function HaDashboard:onInputEvent()
         -- needing a second tap.
     end
     -- Tap-to-light: turn the frontlight on on any tap (if allowed right
-    -- now -- see fl_allowed above), auto-off again after 30s of no
-    -- further taps. Replaces KOReader's own generic autodim timer
-    -- (disabled in settings.reader.lua), which had no way to gate on an
-    -- HA condition and fought any attempt to control it from here.
+    -- now -- see fl_allowed above), auto-off again after fl_auto_off_s
+    -- seconds of no further taps. Both that duration and the brightness
+    -- level applied here are HA-adjustable (see the two "number"
+    -- entities in mqttPublishDiscovery). Replaces KOReader's own
+    -- generic autodim timer (disabled in settings.reader.lua), which
+    -- had no way to gate on an HA condition and fought any attempt to
+    -- control it from here.
     if fl_allowed then
         local powerd = Device:getPowerDevice()
-        if powerd and not powerd:isFrontlightOn() then
-            powerd:turnOnFrontlight()
+        if powerd then
+            powerd:setIntensity(fl_wake_brightness)
         end
         if fl_off_task then
             UIManager:unschedule(fl_off_task)
@@ -1612,7 +1660,7 @@ function HaDashboard:onInputEvent()
             local powerd2 = Device:getPowerDevice()
             if powerd2 then powerd2:turnOffFrontlight() end
         end
-        UIManager:scheduleIn(30, fl_off_task)
+        UIManager:scheduleIn(fl_auto_off_s, fl_off_task)
     end
 end
 

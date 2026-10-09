@@ -93,4 +93,8 @@ return {
     -- same bundled Device, no separate helper entity required. This
     -- setting is only for a REST-polled entity instead/as well.
     frontlight_entity = nil, -- e.g. "input_boolean.kindle_frontlight_allowed"
+    -- If mqtt_host is set, the auto-off duration and the brightness
+    -- level applied on wake are ALSO exposed as adjustable "number"
+    -- entities on the same bundled Device -- no config needed here for
+    -- those, they're controlled live from HA once connected.
 }
