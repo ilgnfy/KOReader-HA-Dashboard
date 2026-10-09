@@ -1630,6 +1630,24 @@ function HaDashboard:init()
     -- wrapped onCloseWidget this sets up internally -- no manual cleanup
     -- needed.
     UIManager.event_hook:registerWidget("InputEvent", self)
+
+    self:scheduleMqttTick()
+end
+
+-- A separate, much faster ticker than the main 60s HA poll -- MQTT
+-- messages (HA-side switch/number changes) are only actually read when
+-- something calls the client's iteration method, which the main poll
+-- only does once every POLL_INTERVAL_S. Without this, a command sent
+-- from HA while the dashboard is awake could sit unapplied for up to a
+-- minute. This only drives the MQTT client (cheap, 50ms-bounded) and
+-- skips the expensive fetchAllStates/haSetState work the main poll does.
+function HaDashboard:scheduleMqttTick()
+    self._mqtt_task = function()
+        if self._closed or ps_sleeping then return end
+        mqttTick(self.settings, nil)
+        self:scheduleMqttTick()
+    end
+    UIManager:scheduleIn(3, self._mqtt_task)
 end
 
 function HaDashboard:onInputEvent()
@@ -1670,6 +1688,9 @@ function HaDashboard:enterPowerSaving()
     if self._poll_task then
         UIManager:unschedule(self._poll_task)
     end
+    if self._mqtt_task then
+        UIManager:unschedule(self._mqtt_task)
+    end
     mqttDisconnect()
     setWifiEnabled(false)
     if fl_off_task then
@@ -1700,6 +1721,7 @@ function HaDashboard:wakeFromPowerSaving()
     end
     setWifiEnabled(true)
     self:schedulePoll()
+    self:scheduleMqttTick()
     -- Wi-Fi needs a moment to reassociate -- same reasoning as the
     -- existing scene/all-lights double-refresh delay.
     UIManager:scheduleIn(3, function()
@@ -1865,6 +1887,9 @@ function HaDashboard:onClose()
     self._closed = true
     if self._poll_task then
         UIManager:unschedule(self._poll_task)
+    end
+    if self._mqtt_task then
+        UIManager:unschedule(self._mqtt_task)
     end
     UIManager:close(self)
     -- Force a full flashing refresh of whatever's now on top, clearing any
