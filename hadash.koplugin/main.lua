@@ -105,7 +105,19 @@ end
 local function haGetCached(dashboard_self, settings, entity_id)
     local cache = dashboard_self and dashboard_self._poll_cache
     if cache and cache[entity_id] ~= nil then return cache[entity_id] end
-    return haGet(settings, "/api/states/" .. entity_id)
+    local state, conn_err = haGet(settings, "/api/states/" .. entity_id)
+    -- A cache miss here means this entity_id was simply absent from the
+    -- batch template result (deleted/renamed/typo'd in config, not a
+    -- network problem) -- that's a per-entity failure, not a connection
+    -- one, UNLESS this live fallback GET itself then also fails at the
+    -- connection level. Flagging that distinctly on dashboard_self (not
+    -- just returning nil like a per-entity miss) is what keeps a single
+    -- permanently-missing entity from being misread as "the network is
+    -- down" forever (see refreshAllTiles).
+    if conn_err and dashboard_self then
+        dashboard_self._poll_conn_err = true
+    end
+    return state
 end
 
 local function haCallService(settings, domain, service, payload)
@@ -635,7 +647,7 @@ local function fetchAllStates(settings)
     if settings.solar_power_entity then table.insert(entity_ids, settings.solar_power_entity) end
     if settings.consumption_entity then table.insert(entity_ids, settings.consumption_entity) end
     if settings.frontlight_entity then table.insert(entity_ids, settings.frontlight_entity) end
-    if #entity_ids == 0 then return {} end
+    if #entity_ids == 0 then return {}, false end
 
     local quoted_ids = {}
     for _, id in ipairs(entity_ids) do table.insert(quoted_ids, string.format("%q", id)) end
@@ -665,15 +677,20 @@ local function fetchAllStates(settings)
     }
     if ok and code == 200 then
         local decode_ok, decoded = pcall(JSON.decode, table.concat(resp_body))
-        if decode_ok and type(decoded) == "table" then return decoded end
+        if decode_ok and type(decoded) == "table" then return decoded, false end
     end
     logger.warn("hadash: template fetch failed, falling back to per-entity GET", ok, code, table.concat(resp_body):sub(1, 300))
+    -- `ok` false here is itself a connection-level failure of the template
+    -- request (not just a bad response) -- carry that through even if
+    -- every per-entity GET below happens to then succeed.
+    local had_conn_err = not ok
 
     local states = {}
     for _, entity_id in ipairs(entity_ids) do
         local state, conn_err = haGet(settings, "/api/states/" .. entity_id)
         states[entity_id] = state
         if conn_err then
+            had_conn_err = true
             -- Network itself is down (not just this one entity) -- every
             -- remaining GET in this loop would hit the same failure, so
             -- stop here instead of burning a full http.TIMEOUT on each of
@@ -684,7 +701,7 @@ local function fetchAllStates(settings)
             break
         end
     end
-    return states
+    return states, had_conn_err
 end
 
 ----------------------------------------------------------------
@@ -841,11 +858,8 @@ local function buildOnOffTile(settings, light, state, width, height, dashboard_s
             end)
             -- Any action might be part of an HA automation touching other
             -- entities too (or was done from a phone seconds earlier) --
-            -- resync the whole dashboard, not just this tile, same as the
-            -- scene/all-lights actions already do. Twice: once past
-            -- typical propagation lag, once more for stragglers.
-            UIManager:scheduleIn(0.8, function() dashboard_self:refreshAllTiles() end)
-            UIManager:scheduleIn(2.5, function() dashboard_self:refreshAllTiles() end)
+            -- debounced resync of the whole dashboard, not just this tile.
+            dashboard_self:scheduleFullRefresh()
         end,
     }
     if is_on then whiten(toggle_btn) end
@@ -950,8 +964,7 @@ local function buildDimmableCard(settings, light, state, width, dashboard_self)
                 refreshFromServer()
                 dashboard_self:refreshHeaderBadges()
             end)
-            UIManager:scheduleIn(0.8, function() dashboard_self:refreshAllTiles() end)
-            UIManager:scheduleIn(2.5, function() dashboard_self:refreshAllTiles() end)
+            dashboard_self:scheduleFullRefresh()
         end,
     }
     if is_on then whiten(toggle_btn) end
@@ -977,8 +990,7 @@ local function buildDimmableCard(settings, light, state, width, dashboard_self)
                 refreshFromServer()
                 dashboard_self:refreshHeaderBadges()
             end)
-            UIManager:scheduleIn(0.8, function() dashboard_self:refreshAllTiles() end)
-            UIManager:scheduleIn(2.5, function() dashboard_self:refreshAllTiles() end)
+            dashboard_self:scheduleFullRefresh()
         end
         UIManager:scheduleIn(0.3, send_task)
     end
@@ -1038,20 +1050,6 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
     local selected = 1
     local card, current_text, humidity_text, target_text, heat_btn
     local selector_btns = {}
-    -- Shared debounce for the full-dashboard resync below -- the preset/
-    -- temp-step buttons can get tapped several times in quick succession,
-    -- and re-scheduling instead of stacking keeps that from queuing up a
-    -- pile of redundant refreshes (and e-ink flashes) for one intent.
-    local full_refresh_task1, full_refresh_task2
-    local function scheduleFullRefresh()
-        if full_refresh_task1 then UIManager:unschedule(full_refresh_task1) end
-        if full_refresh_task2 then UIManager:unschedule(full_refresh_task2) end
-        full_refresh_task1 = function() dashboard_self:refreshAllTiles() end
-        full_refresh_task2 = function() dashboard_self:refreshAllTiles() end
-        UIManager:scheduleIn(0.8, full_refresh_task1)
-        UIManager:scheduleIn(2.5, full_refresh_task2)
-    end
-
     -- Ambient humidity, shown next to the current temperature (same
     -- source that used to be the header's own temp/humidity chip, now
     -- removed -- the temperature half of that is already this card's own
@@ -1153,7 +1151,7 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
             end
         end
         UIManager:scheduleIn(0.4, refreshFromServer)
-        scheduleFullRefresh()
+        dashboard_self:scheduleFullRefresh()
     end
 
     for i, heater in ipairs(heaters) do
@@ -1236,7 +1234,7 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
                 refreshFromServer()
                 dashboard_self:refreshHeaderBadges()
             end)
-            scheduleFullRefresh()
+            dashboard_self:scheduleFullRefresh()
         end,
     }
     if initial_is_heat then whiten(heat_btn) end
@@ -1257,7 +1255,7 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
                 refreshFromServer()
                 dashboard_self:refreshHeaderBadges()
             end)
-            scheduleFullRefresh()
+            dashboard_self:scheduleFullRefresh()
         end
     end
 
@@ -1327,7 +1325,7 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
                 refreshFromServer()
                 dashboard_self:refreshHeaderBadges()
             end)
-            scheduleFullRefresh()
+            dashboard_self:scheduleFullRefresh()
             end,
         })
     end
@@ -2089,6 +2087,26 @@ end
 -- a scene, changing the heater, etc. also catches any OTHER entity it
 -- affected (e.g. a scene turning on several lights, not just the button
 -- tapped), not just the one tile that was interacted with.
+-- Debounced, single scheduled full resync -- used after any single-tile
+-- action (toggle/slider/heater/preset) so a quick run of taps collapses
+-- into one refreshAllTiles call instead of each tap stacking its own
+-- pair of full fetches on top of the per-tile 0.4s resync every other
+-- callback already does (that redundant stacking was a real UI-freeze
+-- risk under a slow/flaky connection -- one tap could have queued three
+-- separate full-dashboard fetches in a row). Scene/all-lights keep
+-- their own longer double-refresh below -- those can legitimately take
+-- longer to propagate across several real bulbs.
+function HaDashboard:scheduleFullRefresh()
+    if self._full_refresh_task then
+        UIManager:unschedule(self._full_refresh_task)
+    end
+    self._full_refresh_task = function()
+        if self._closed then return end
+        self:refreshAllTiles()
+    end
+    UIManager:scheduleIn(1.5, self._full_refresh_task)
+end
+
 function HaDashboard:refreshAllTiles()
     if self._closed then return end
     local powerd = Device:getPowerDevice()
@@ -2110,7 +2128,10 @@ function HaDashboard:refreshAllTiles()
     end
     -- One combined fetch for every tile this tick instead of one GET per
     -- tile's own closure (see fetchAllStates/haGetCached above).
-    self._poll_cache = fetchAllStates(self.settings)
+    self._poll_conn_err = false
+    local template_conn_err
+    self._poll_cache, template_conn_err = fetchAllStates(self.settings)
+    if template_conn_err then self._poll_conn_err = true end
     -- Optional: an HA entity (e.g. a lux-sensor-driven automation with a
     -- time-of-day condition) gates whether tapping is ALLOWED to turn
     -- the frontlight on at all -- e.g. off during the day when there's
@@ -2131,7 +2152,14 @@ function HaDashboard:refreshAllTiles()
     self:refreshHeaderBadges()
     self._poll_cache = nil
     self:setStale(any_failed)
-    if any_failed then
+    -- Deliberately gated on _poll_conn_err (a real connection-level
+    -- failure -- network down, DNS, timeout), not any_failed (which also
+    -- trips on something as mundane as one typo'd/deleted entity_id
+    -- returning a per-entity miss forever). Using any_failed here used
+    -- to mean a single bad entity in config would spam setWifiEnabled
+    -- every poll and permanently freeze "Last Successful Poll" even
+    -- though the network itself -- and every other entity -- was fine.
+    if self._poll_conn_err then
         -- The one-shot setWifiEnabled(true) in wakeFromPowerSaving only
         -- fires on the asleep->awake transition. If that single
         -- lipc-set-prop call doesn't actually bring the radio back up
@@ -2139,14 +2167,14 @@ function HaDashboard:refreshAllTiles()
         -- ops keep last_activity moving, so there's no sleep/wake cycle
         -- to retry on -- but every poll fails with "Network is
         -- unreachable" indefinitely). Re-asserting it here on every
-        -- failed poll is cheap and idempotent, and is the only other
-        -- place that can retry it.
+        -- connection-level failure is cheap and idempotent, and is the
+        -- only other place that can retry it.
         setWifiEnabled(true)
     else
         last_poll_ok_time = os.time()
     end
     mqttTick(self.settings, battery)
-    return not any_failed
+    return not self._poll_conn_err
 end
 
 -- Periodic tick (milestone 4, "robustness"). Every Nth tick instead does
