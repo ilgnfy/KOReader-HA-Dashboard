@@ -177,6 +177,11 @@ local fl_off_task = nil
 -- Both HA-adjustable via MQTT (number entities) -- see mqttPublishDiscovery.
 local fl_auto_off_s = 30
 local fl_wake_brightness = 12 -- native Kindle scale is 0-24, not 0-100
+-- HA-adjustable via MQTT too; seeded once from settings.power_saving_
+-- timeout_s on first use (not every full-rebuild, or a live MQTT change
+-- would get reset back to the config-file value every ~30 min).
+local ps_timeout_s = 300
+local ps_timeout_seeded = false
 
 local MQTT_DEVICE = {
     identifiers = { "kindle_dashboard" },
@@ -210,6 +215,15 @@ local function mqttConnect(settings)
         username = settings.mqtt_user,
         password = settings.mqtt_password,
         clean = true,
+        -- Last Will: the BROKER publishes this itself if the connection
+        -- drops without a clean disconnect (e.g. Wi-Fi cut abruptly) --
+        -- this is what lets HA mark the whole device unavailable
+        -- promptly even on an ungraceful drop, not just when we
+        -- ourselves remember to say so. Entering Power Saving also
+        -- publishes this explicitly before disconnecting (see
+        -- mqttDisconnect), since waiting for the broker's own keepalive-
+        -- timeout detection would be slower than doing it ourselves.
+        will = { topic = "kindle_dashboard/availability", payload = "offline", retain = true },
     })
     if not ok or not client then
         logger.warn("hadash: mqtt client creation failed", client)
@@ -218,7 +232,9 @@ local function mqttConnect(settings)
     client:on{
         connect = function()
             mqtt_discovery_sent = false
+            client:publish{ topic = "kindle_dashboard/availability", payload = "online", retain = true }
             client:subscribe{ topic = "kindle_dashboard/power_saving/set" }
+            client:subscribe{ topic = "kindle_dashboard/power_saving_timeout_s/set" }
             client:subscribe{ topic = "kindle_dashboard/frontlight_allowed/set" }
             client:subscribe{ topic = "kindle_dashboard/frontlight_auto_off_s/set" }
             client:subscribe{ topic = "kindle_dashboard/frontlight_brightness/set" }
@@ -226,6 +242,9 @@ local function mqttConnect(settings)
         message = function(msg)
             if msg.topic == "kindle_dashboard/power_saving/set" then
                 ps_armed = (tostring(msg.payload) == "ON")
+            elseif msg.topic == "kindle_dashboard/power_saving_timeout_s/set" then
+                local n = tonumber(msg.payload)
+                if n then ps_timeout_s = math.max(30, math.min(3600, n)) end
             elseif msg.topic == "kindle_dashboard/frontlight_allowed/set" then
                 fl_allowed = (tostring(msg.payload) == "ON")
             elseif msg.topic == "kindle_dashboard/frontlight_auto_off_s/set" then
@@ -246,45 +265,74 @@ local function mqttConnect(settings)
     mqtt_client = client
 end
 
+-- Shared by every discovered entity below: lets HA mark the whole
+-- device "unavailable" (grayed out, not just showing a stale retained
+-- value) whenever this topic says "offline" -- set via the client's
+-- own Last Will (ungraceful drops) or explicitly by us (graceful ones,
+-- e.g. entering Power Saving). Addresses the real gap otherwise: HA has
+-- no idea the device is asleep and Wi-Fi is off, so without this it
+-- would keep showing the last values as if still live and controllable.
+local function withAvailability(t)
+    t.availability_topic = "kindle_dashboard/availability"
+    t.payload_available = "online"
+    t.payload_not_available = "offline"
+    return t
+end
+
 local function mqttPublishDiscovery()
     if not mqtt_client or mqtt_discovery_sent then return end
     mqtt_client:publish{
         topic = "homeassistant/sensor/kindle_dashboard/battery/config",
-        payload = JSON.encode{
+        payload = JSON.encode(withAvailability{
             name = "Battery",
             unique_id = "kindle_dashboard_battery",
             device_class = "battery",
             unit_of_measurement = "%",
             state_topic = "kindle_dashboard/battery/state",
             device = MQTT_DEVICE,
-        },
+        }),
         retain = true,
     }
     mqtt_client:publish{
         topic = "homeassistant/switch/kindle_dashboard/power_saving/config",
-        payload = JSON.encode{
+        payload = JSON.encode(withAvailability{
             name = "Power Saving",
             unique_id = "kindle_dashboard_power_saving",
             state_topic = "kindle_dashboard/power_saving/state",
             command_topic = "kindle_dashboard/power_saving/set",
             device = MQTT_DEVICE,
-        },
+        }),
+        retain = true,
+    }
+    mqtt_client:publish{
+        topic = "homeassistant/number/kindle_dashboard/power_saving_timeout_s/config",
+        payload = JSON.encode(withAvailability{
+            name = "Power Saving Idle Timeout",
+            unique_id = "kindle_dashboard_power_saving_timeout_s",
+            state_topic = "kindle_dashboard/power_saving_timeout_s/state",
+            command_topic = "kindle_dashboard/power_saving_timeout_s/set",
+            min = 30,
+            max = 3600,
+            step = 30,
+            unit_of_measurement = "s",
+            device = MQTT_DEVICE,
+        }),
         retain = true,
     }
     mqtt_client:publish{
         topic = "homeassistant/switch/kindle_dashboard/frontlight_allowed/config",
-        payload = JSON.encode{
+        payload = JSON.encode(withAvailability{
             name = "Frontlight Allowed",
             unique_id = "kindle_dashboard_frontlight_allowed",
             state_topic = "kindle_dashboard/frontlight_allowed/state",
             command_topic = "kindle_dashboard/frontlight_allowed/set",
             device = MQTT_DEVICE,
-        },
+        }),
         retain = true,
     }
     mqtt_client:publish{
         topic = "homeassistant/number/kindle_dashboard/frontlight_auto_off_s/config",
-        payload = JSON.encode{
+        payload = JSON.encode(withAvailability{
             name = "Frontlight Auto-off Seconds",
             unique_id = "kindle_dashboard_frontlight_auto_off_s",
             state_topic = "kindle_dashboard/frontlight_auto_off_s/state",
@@ -294,12 +342,12 @@ local function mqttPublishDiscovery()
             step = 5,
             unit_of_measurement = "s",
             device = MQTT_DEVICE,
-        },
+        }),
         retain = true,
     }
     mqtt_client:publish{
         topic = "homeassistant/number/kindle_dashboard/frontlight_brightness/config",
-        payload = JSON.encode{
+        payload = JSON.encode(withAvailability{
             name = "Frontlight Brightness on Wake",
             unique_id = "kindle_dashboard_frontlight_brightness",
             state_topic = "kindle_dashboard/frontlight_brightness/state",
@@ -311,7 +359,7 @@ local function mqttPublishDiscovery()
             max = 24,
             step = 1,
             device = MQTT_DEVICE,
-        },
+        }),
         retain = true,
     }
     mqtt_discovery_sent = true
@@ -319,6 +367,12 @@ end
 
 local function mqttDisconnect()
     if not mqtt_client then return end
+    -- Graceful path: say so ourselves immediately, rather than relying
+    -- on the broker's own keepalive-timeout-based Last Will detection,
+    -- which is correct but slower (bounded by the keepalive interval).
+    pcall(function()
+        mqtt_client:publish{ topic = "kindle_dashboard/availability", payload = "offline", retain = true }
+    end)
     pcall(function() mqtt_client:disconnect() end)
     mqtt_client = nil
     mqtt_discovery_sent = false
@@ -347,6 +401,7 @@ local function mqttTick(settings, battery_pct)
             mqtt_client:publish{ topic = "kindle_dashboard/battery/state", payload = tostring(battery_pct), retain = true }
         end
         mqtt_client:publish{ topic = "kindle_dashboard/power_saving/state", payload = ps_armed and "ON" or "OFF", retain = true }
+        mqtt_client:publish{ topic = "kindle_dashboard/power_saving_timeout_s/state", payload = tostring(ps_timeout_s), retain = true }
         mqtt_client:publish{ topic = "kindle_dashboard/frontlight_allowed/state", payload = fl_allowed and "ON" or "OFF", retain = true }
         mqtt_client:publish{ topic = "kindle_dashboard/frontlight_auto_off_s/state", payload = tostring(fl_auto_off_s), retain = true }
         mqtt_client:publish{ topic = "kindle_dashboard/frontlight_brightness/state", payload = tostring(fl_wake_brightness), retain = true }
@@ -1851,9 +1906,12 @@ end
 -- partial updates in between.
 function HaDashboard:runPoll()
     if self._closed then return end
+    if not ps_timeout_seeded then
+        ps_timeout_seeded = true
+        ps_timeout_s = self.settings.power_saving_timeout_s or 300
+    end
     if ps_armed and not ps_sleeping then
-        local timeout = self.settings.power_saving_timeout_s or 300
-        if os.time() - last_activity >= timeout then
+        if os.time() - last_activity >= ps_timeout_s then
             self:enterPowerSaving()
             return
         end
