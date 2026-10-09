@@ -1240,7 +1240,13 @@ function HaDashboard:init()
                 table.insert(tile_row, HorizontalSpan:new{ width = GUTTER })
                 table.insert(tile_row, buildOnOffTile(settings, right_light, states[right_light.entity], tile_w, tile_h, self))
             end
-            table.insert(rows, HorizontalGroup:new(tile_row))
+            -- Without this, a row with only the left tile (odd entry)
+            -- is narrower than the other rows and gets centered in the
+            -- available width instead of staying flush left.
+            table.insert(rows, LeftContainer:new{
+                dimen = { w = content_w, h = tile_h },
+                HorizontalGroup:new(tile_row),
+            })
         end
     end
 
