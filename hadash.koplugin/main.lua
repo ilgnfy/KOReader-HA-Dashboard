@@ -1061,6 +1061,20 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
 
     local function currentHeater() return heaters[selected] end
 
+    -- Sends "off" to every configured heater except keep_idx. Used
+    -- anywhere a heater gets turned on (selecting it, the Heat/Off
+    -- toggle, a preset), not just once at selection time -- these are
+    -- two separate real devices (Electric/Oil), and only the HA calls
+    -- below actually guarantee mutual exclusivity; the selector UI by
+    -- itself does not.
+    local function turnOffOtherHeaters(keep_idx)
+        for i, h in ipairs(heaters) do
+            if i ~= keep_idx then
+                haCallService(settings, "climate", "set_hvac_mode", { entity_id = h.entity, hvac_mode = "off" })
+            end
+        end
+    end
+
     -- Includes `selected`: switching the displayed heater must always
     -- repaint, even when neither heater's own HA state happens to have
     -- changed (e.g. both are already off) -- otherwise the diff check
@@ -1126,11 +1140,26 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
         if humidity_sensor then
             heater_states[humidity_sensor.entity] = haGetCached(dashboard_self, settings, humidity_sensor.entity)
         end
+        -- Mutually exclusive by design (only one real heater should ever
+        -- run at once), but the off-call that's supposed to guarantee
+        -- that is still just a single fire-and-forget HA service call
+        -- (see turnOffOtherHeaters) -- if one of those ever fails (a
+        -- dropped connection, HA momentarily unreachable) nothing
+        -- retried it. Checking the ACTUAL reported state here, every
+        -- poll, is what catches and corrects that for real, instead of
+        -- just picking whichever one to display.
+        local heating_idxs = {}
         for i, h in ipairs(heaters) do
             local s = heater_states[h.entity]
-            if s and s.state == "heat" then
-                selected = i
-                break
+            if s and s.state == "heat" then table.insert(heating_idxs, i) end
+        end
+        if #heating_idxs > 0 then
+            selected = heating_idxs[1]
+        end
+        if #heating_idxs > 1 then
+            logger.warn("hadash: multiple heaters reporting heat simultaneously, forcing exclusivity", #heating_idxs)
+            for n = 2, #heating_idxs do
+                haCallService(settings, "climate", "set_hvac_mode", { entity_id = heaters[heating_idxs[n]].entity, hvac_mode = "off" })
             end
         end
         local sig = computeSignature()
@@ -1145,11 +1174,7 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
     local function selectHeater(idx)
         if idx == selected then return end
         selected = idx
-        for i, h in ipairs(heaters) do
-            if i ~= idx then
-                haCallService(settings, "climate", "set_hvac_mode", { entity_id = h.entity, hvac_mode = "off" })
-            end
-        end
+        turnOffOtherHeaters(idx)
         UIManager:scheduleIn(0.4, refreshFromServer)
         dashboard_self:scheduleFullRefresh()
     end
@@ -1230,6 +1255,9 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
                 entity_id = heater.entity,
                 hvac_mode = is_heat and "off" or "heat",
             })
+            if not is_heat then
+                turnOffOtherHeaters(selected)
+            end
             UIManager:scheduleIn(0.4, function()
                 refreshFromServer()
                 dashboard_self:refreshHeaderBadges()
@@ -1321,6 +1349,7 @@ local function buildClimateCard(settings, heater_states, width, dashboard_self)
                     temperature = preset.temp,
                     hvac_mode = "heat",
                 })
+                turnOffOtherHeaters(selected)
                 UIManager:scheduleIn(0.4, function()
                 refreshFromServer()
                 dashboard_self:refreshHeaderBadges()
