@@ -2025,6 +2025,19 @@ function HaDashboard:wakeFromPowerSaving()
         UIManager:close(self._ps_overlay)
         self._ps_overlay = nil
     end
+    -- One-shot by design: arming PS means "sleep after idle, then once I
+    -- wake it back up, stay fully awake until I arm it again" -- for the
+    -- away/home cycle (arm when leaving, wake it up again when you're
+    -- back, and it just stays on instead of re-sleeping on the same
+    -- timeout every time while you're home). Auto-disarming here, not
+    -- just on explicit tap/HA-toggle, is what makes that automatic.
+    ps_armed = false
+    if self.stale_frame and self.stale_frame.ps_btn then
+        local btn = self.stale_frame.ps_btn
+        btn.frame.background = Blitbuffer.COLOR_WHITE
+        btn.label_widget.fgcolor = Blitbuffer.COLOR_BLACK
+        partialRefresh(self, self.stale_frame)
+    end
     setWifiEnabled(true)
     self:schedulePoll()
     self:scheduleMqttTick()
